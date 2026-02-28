@@ -1,0 +1,17 @@
+linux-6.17.tar.xz
+*.tar.xz
+*.tar.gz
+*.tar.xz
+*.tar.gz
+*.tar.bz2
+linux-*/
+*.o
+*.ko
+*.mod.c
+*.mod
+.tmp_versions/
+modules.order
+Module.symvers
+linux-source/
+linux-*/
+build/
