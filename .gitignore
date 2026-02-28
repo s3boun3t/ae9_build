@@ -14,4 +14,3 @@ modules.order
 Module.symvers
 linux-source/
 linux-*/
-build/
