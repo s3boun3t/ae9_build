@@ -1134,7 +1134,6 @@ struct ca0132_spec {
 
 	struct hda_codec *codec;
 	struct delayed_work unsol_hp_work;
-	struct delayed_work ae9_acm_work;
 
 #ifdef ENABLE_TUNING_CONTROLS
 	long cur_ctl_vals[TUNING_CTLS_COUNT];
@@ -8464,133 +8463,203 @@ static void ae5_setup_defaults(struct hda_codec *codec)
  * Setup default parameters for the Sound Blaster AE-7 DSP.
  */
 /*
- * AE-9 ACM (Audio Control Module) communication.
+ * AE-9 ACM (Audio Control Module) communication via HDA verbs.
  *
- * The ACM breakout box communicates via HDA vendor verbs on D1, NID 0x15.
- * Verb 0x707 (VENDOR_CHIPIO_8051_DATA_WRITE) sends one byte to the ACM.
- * This is the SAME verb used by the DSP for 8051 microcontroller access,
- * so ACM init MUST be deferred until all DSP init verbs are complete.
+ * DISCOVERY (February 2026):
+ * The ACM is NOT controlled via MMIO registers at BAR2+0xC00-0xC0C.
+ * Those registers are unrelated to ACM on the AE-9 — writing to them
+ * corrupts the hardware state.
+ *
+ * The real protocol uses HDA vendor verbs on the second codec (D2,
+ * addr=2, SSID 0x11020072), node 0x15:
+ *
+ *   verb 0x707 param=<byte>  ->  send one byte to ACM
+ *   verb 0xf07 param=0       ->  read ACM response byte (full-duplex)
+ *   verb 0xf03 param=0       ->  read ACM status (0x83 = ready)
+ *
+ * Every byte sent via 0x707 produces an immediate response via 0xf07.
+ * The ACM status (0xf03) stays at 0x83 throughout normal operation.
+ *
+ * Access: codec D2 shares the same hda_bus as D1. We reach it via
+ * snd_hda_codec_read/write() using the bus pointer from D1's codec.
  */
-static void ae9_acm_send(struct hda_codec *codec,
+
+/* HDA verb constants for ACM communication via codec D2, NID 0x15 */
+#define AE9_ACM_NID		0x15
+#define AE9_ACM_VERB_WRITE	0x707  /* write one byte to ACM        */
+#define AE9_ACM_VERB_READ	0xf07  /* read ACM response byte        */
+#define AE9_ACM_VERB_STATUS	0xf03  /* read ACM general status       */
+#define AE9_ACM_STATUS_READY	0x83   /* ACM is alive and ready        */
+
+/*
+ * ae9_acm_send - send a byte sequence to the ACM and log responses.
+ * @d2:   pointer to the second CA0132 codec (addr=2)
+ * @name: sequence name for debug logging
+ * @data: byte array to send
+ * @len:  number of bytes
+ */
+static void ae9_acm_send(struct hda_codec *d2, const char *name,
 			  const unsigned int *data, int len)
 {
+	unsigned int resp;
 	int i;
 
-	for (i = 0; i < len; i++)
-		snd_hda_codec_write(codec, 0x15, 0,
-				    VENDOR_CHIPIO_8051_DATA_WRITE,
-				    data[i]);
+	for (i = 0; i < len; i++) {
+		snd_hda_codec_write(d2, AE9_ACM_NID, 0,
+				    AE9_ACM_VERB_WRITE, data[i]);
+		resp = snd_hda_codec_read(d2, AE9_ACM_NID, 0,
+					  AE9_ACM_VERB_READ, 0);
+		codec_dbg(d2, "AE-9 ACM %s[%d]: sent=0x%02x resp=0x%02x\n",
+			  name, i, data[i], resp);
+	}
 }
 
-static void ae9_acm_init(struct hda_codec *codec)
+static int ae9_acm_init(struct hda_codec *codec)
 {
-	unsigned int val;
+	struct hda_codec *d2 = NULL;
+	struct hda_codec *c;
+	unsigned int status;
+	int wait;
 
-	static const unsigned int reset[] = {0x81, 0x00};
+	/*
+	 * Sequences derived from USB protocol capture of Windows driver
+	 * init, confirmed working via hda-verb testing on real hardware.
+	 */
+	static const unsigned int reset[]  = {0x81, 0x00};
 	static const unsigned int hs_fwd[] = {
 		0x54, 0x04, 0x41, 0x63, 0x6d, 0x31};
 	static const unsigned int hs_rev[] = {
 		0x54, 0x04, 0x31, 0x6d, 0x63, 0x41};
-	static const unsigned int cfg[] = {
+	static const unsigned int cfg[]    = {
 		0xd5, 0x03, 0x00, 0x20, 0x04};
-	static const unsigned int stchk[] = {
+	static const unsigned int stchk[]  = {
 		0x54, 0x04, 0x11, 0x11, 0x11, 0x11};
-	static const unsigned int key[] = {
+	static const unsigned int key[]    = {
 		0x55, 0x07, 0x00, 0x20, 0x04,
 		0xde, 0xc0, 0xad, 0xde};
-	static const unsigned int gpio1[] = {
+	static const unsigned int gpio1[]  = {
 		0x03, 0x03, 0x05, 0x03, 0x03};
-	static const unsigned int sr48[] = {
+	static const unsigned int sr48[]   = {
 		0x32, 0x03, 0x02, 0xb8, 0x0b};
-	static const unsigned int vol[] = {
+	static const unsigned int vol[]    = {
 		0x43, 0x04, 0x64, 0x00, 0xf4, 0x01};
-	static const unsigned int sr96[] = {
+	static const unsigned int sr96[]   = {
 		0x32, 0x03, 0x01, 0x88, 0x13};
-	static const unsigned int ch[] = {
+	static const unsigned int ch[]     = {
 		0x05, 0x03, 0x02, 0x01, 0x00};
 	static const unsigned int unmute1[] = {0x22, 0x02, 0x01, 0x00};
 	static const unsigned int mute2[]   = {0x22, 0x02, 0x02, 0x01};
-	static const unsigned int gpio2[] = {
+	static const unsigned int gpio2[]  = {
 		0x03, 0x03, 0x02, 0x00, 0x40};
-	static const unsigned int name[] = {
+	static const unsigned int name[]   = {
 		0x11, 0x09, 0x41, 0x45, 0x2d, 0x39,
 		0x00, 0x00, 0x00, 0x00, 0x00};
-	static const unsigned int pwr[] = {
+	static const unsigned int pwr[]    = {
 		0x21, 0x03, 0x02, 0x00, 0x00};
-	static const unsigned int out1[]  = {0x83, 0x01, 0x02};
-	static const unsigned int out2[]  = {0x83, 0x01, 0x07};
-	static const unsigned int query[] = {0xc2, 0x00};
-	static const unsigned int insel[] = {0x85, 0x01, 0x02};
-	static const unsigned int dac1[]  = {0xb1, 0x01, 0x01};
-	static const unsigned int dac2[]  = {0xb1, 0x01, 0x02};
-	static const unsigned int dac3[]  = {0xb1, 0x01, 0x03};
+	static const unsigned int out1[]   = {0x83, 0x01, 0x02};
+	static const unsigned int out2[]   = {0x83, 0x01, 0x07};
+	static const unsigned int query[]  = {0xc2, 0x00};
+	static const unsigned int insel[]  = {0x85, 0x01, 0x02};
+	static const unsigned int dac1[]   = {0xb1, 0x01, 0x01};
+	static const unsigned int dac2[]   = {0xb1, 0x01, 0x02};
+	static const unsigned int dac3[]   = {0xb1, 0x01, 0x03};
+
+	/*
+	 * Find codec D2 (addr=2) on the same HDA bus as D1.
+	 * D2 probe returns -ENODEV (filtered by ca0132_codec_probe)
+	 * but the codec struct remains accessible on the bus.
+	 */
+	list_for_each_entry(c, &codec->bus->core.codec_list, core.list) {
+		if (c->core.addr == 2) {
+			d2 = c;
+			break;
+		}
+	}
+
+	if (!d2) {
+		codec_warn(codec,
+			"AE-9: codec D2 not found, ACM init skipped\n");
+		return -ENODEV;
+	}
+
+	/* Verify ACM is alive before proceeding */
+	status = snd_hda_codec_read(d2, AE9_ACM_NID, 0,
+				    AE9_ACM_VERB_STATUS, 0);
+	codec_info(codec, "AE-9: ACM status before init: 0x%02x\n",
+		   status & 0xff);
+
+	if ((status & 0xff) != AE9_ACM_STATUS_READY) {
+		/*
+		 * ACM not ready yet — wait up to 8 seconds.
+		 * On a cold boot the ACM board needs time to initialize.
+		 */
+		for (wait = 0; wait < 80; wait++) {
+			msleep(100);
+			status = snd_hda_codec_read(d2, AE9_ACM_NID, 0,
+						    AE9_ACM_VERB_STATUS, 0);
+			if ((status & 0xff) == AE9_ACM_STATUS_READY)
+				break;
+		}
+		codec_info(codec,
+			"AE-9: ACM status after %dms wait: 0x%02x\n",
+			wait * 100, status & 0xff);
+	}
+
+	if ((status & 0xff) != AE9_ACM_STATUS_READY) {
+		codec_warn(codec,
+			"AE-9: ACM not ready (status=0x%02x), "
+			"continuing anyway\n", status & 0xff);
+	}
 
 	codec_info(codec, "AE-9: starting ACM init via HDA verbs\n");
 
-	/* Verify DSP is responsive before touching 0x707 */
-	val = snd_hda_codec_read(codec, 0x15, 0,
-				 VENDOR_CHIPIO_8051_DATA_READ, 0);
-	codec_info(codec, "AE-9 pre-ACM 0xf07: 0x%x\n", val);
+	/* Phase 1: reset ACM */
+	ae9_acm_send(d2, "reset", reset, ARRAY_SIZE(reset));
+	usleep_range(2000, 5000);
 
-	/* Phase 1: reset */
-	ae9_acm_send(codec, reset, ARRAY_SIZE(reset));
-	msleep(500);
-
-	/* Phase 2: handshake + encryption key */
-	ae9_acm_send(codec, hs_fwd, ARRAY_SIZE(hs_fwd));
-	ae9_acm_send(codec, hs_rev, ARRAY_SIZE(hs_rev));
-	ae9_acm_send(codec, cfg,    ARRAY_SIZE(cfg));
-	ae9_acm_send(codec, stchk,  ARRAY_SIZE(stchk));
-	ae9_acm_send(codec, hs_fwd, ARRAY_SIZE(hs_fwd));
-	ae9_acm_send(codec, hs_rev, ARRAY_SIZE(hs_rev));
-	ae9_acm_send(codec, key,    ARRAY_SIZE(key));
-	ae9_acm_send(codec, stchk,  ARRAY_SIZE(stchk));
-	msleep(10);
+	/* Phase 2: handshake + config + encryption key */
+	ae9_acm_send(d2, "hs_fwd", hs_fwd, ARRAY_SIZE(hs_fwd));
+	ae9_acm_send(d2, "hs_rev", hs_rev, ARRAY_SIZE(hs_rev));
+	ae9_acm_send(d2, "cfg",    cfg,    ARRAY_SIZE(cfg));
+	ae9_acm_send(d2, "stchk",  stchk,  ARRAY_SIZE(stchk));
+	ae9_acm_send(d2, "hs_fwd", hs_fwd, ARRAY_SIZE(hs_fwd));
+	ae9_acm_send(d2, "hs_rev", hs_rev, ARRAY_SIZE(hs_rev));
+	ae9_acm_send(d2, "key",    key,    ARRAY_SIZE(key));
+	ae9_acm_send(d2, "stchk",  stchk,  ARRAY_SIZE(stchk));
+	usleep_range(5000, 10000);
 
 	/* Phase 3: audio routing config */
-	ae9_acm_send(codec, gpio1,   ARRAY_SIZE(gpio1));
-	ae9_acm_send(codec, sr48,    ARRAY_SIZE(sr48));
-	ae9_acm_send(codec, vol,     ARRAY_SIZE(vol));
-	ae9_acm_send(codec, sr96,    ARRAY_SIZE(sr96));
-	ae9_acm_send(codec, ch,      ARRAY_SIZE(ch));
-	ae9_acm_send(codec, unmute1, ARRAY_SIZE(unmute1));
-	ae9_acm_send(codec, mute2,   ARRAY_SIZE(mute2));
-	ae9_acm_send(codec, gpio2,   ARRAY_SIZE(gpio2));
+	ae9_acm_send(d2, "gpio1",  gpio1,  ARRAY_SIZE(gpio1));
+	ae9_acm_send(d2, "sr48",   sr48,   ARRAY_SIZE(sr48));
+	ae9_acm_send(d2, "vol",    vol,    ARRAY_SIZE(vol));
+	ae9_acm_send(d2, "sr96",   sr96,   ARRAY_SIZE(sr96));
+	ae9_acm_send(d2, "ch",     ch,     ARRAY_SIZE(ch));
+	ae9_acm_send(d2, "unmute", unmute1, ARRAY_SIZE(unmute1));
+	ae9_acm_send(d2, "mute2",  mute2,  ARRAY_SIZE(mute2));
+	ae9_acm_send(d2, "gpio2",  gpio2,  ARRAY_SIZE(gpio2));
 
 	/* Phase 4: identification + output routing */
-	ae9_acm_send(codec, name,  ARRAY_SIZE(name));
-	ae9_acm_send(codec, pwr,   ARRAY_SIZE(pwr));
-	ae9_acm_send(codec, out1,  ARRAY_SIZE(out1));
-	ae9_acm_send(codec, out2,  ARRAY_SIZE(out2));
-	ae9_acm_send(codec, reset, ARRAY_SIZE(reset));
-	msleep(5);
-	ae9_acm_send(codec, hs_fwd, ARRAY_SIZE(hs_fwd));
-	ae9_acm_send(codec, hs_rev, ARRAY_SIZE(hs_rev));
-	ae9_acm_send(codec, cfg,    ARRAY_SIZE(cfg));
-	ae9_acm_send(codec, stchk,  ARRAY_SIZE(stchk));
-	ae9_acm_send(codec, query,  ARRAY_SIZE(query));
-	ae9_acm_send(codec, insel,  ARRAY_SIZE(insel));
-	ae9_acm_send(codec, dac1,   ARRAY_SIZE(dac1));
-	ae9_acm_send(codec, dac2,   ARRAY_SIZE(dac2));
-	ae9_acm_send(codec, dac3,   ARRAY_SIZE(dac3));
+	ae9_acm_send(d2, "name",   name,   ARRAY_SIZE(name));
+	ae9_acm_send(d2, "pwr",    pwr,    ARRAY_SIZE(pwr));
+	ae9_acm_send(d2, "out1",   out1,   ARRAY_SIZE(out1));
+	ae9_acm_send(d2, "out2",   out2,   ARRAY_SIZE(out2));
+	ae9_acm_send(d2, "reset",  reset,  ARRAY_SIZE(reset));
+	usleep_range(2000, 5000);
+	ae9_acm_send(d2, "hs_fwd", hs_fwd, ARRAY_SIZE(hs_fwd));
+	ae9_acm_send(d2, "hs_rev", hs_rev, ARRAY_SIZE(hs_rev));
+	ae9_acm_send(d2, "cfg",    cfg,    ARRAY_SIZE(cfg));
+	ae9_acm_send(d2, "stchk",  stchk,  ARRAY_SIZE(stchk));
+	ae9_acm_send(d2, "query",  query,  ARRAY_SIZE(query));
+	ae9_acm_send(d2, "insel",  insel,  ARRAY_SIZE(insel));
+	ae9_acm_send(d2, "dac1",   dac1,   ARRAY_SIZE(dac1));
+	ae9_acm_send(d2, "dac2",   dac2,   ARRAY_SIZE(dac2));
+	ae9_acm_send(d2, "dac3",   dac3,   ARRAY_SIZE(dac3));
 
-	val = snd_hda_codec_read(codec, 0x15, 0,
-				 VENDOR_CHIPIO_8051_DATA_READ, 0);
-	codec_info(codec, "AE-9: ACM init complete, 0xf07: 0x%x\n", val);
-}
-
-/*
- * Delayed work function for AE-9 ACM init.
- * We defer ACM init by 3 seconds to ensure all DSP init verbs (which
- * also use verb 0x707) have completed and the 8051 is idle.
- */
-static void ae9_acm_delayed_init(struct work_struct *work)
-{
-	struct ca0132_spec *spec = container_of(
-		to_delayed_work(work), struct ca0132_spec, ae9_acm_work);
-	struct hda_codec *codec = spec->codec;
-
-	ae9_acm_init(codec);
+	status = snd_hda_codec_read(d2, AE9_ACM_NID, 0,
+				    AE9_ACM_VERB_STATUS, 0);
+	codec_info(codec, "AE-9: ACM init complete, status=0x%02x\n",
+		   status & 0xff);
+	return 0;
 }
 
 /*
@@ -8683,28 +8752,8 @@ static void ae7_setup_defaults(struct hda_codec *codec)
  */
 static void ae9_setup_defaults(struct hda_codec *codec)
 {
-	struct ca0132_spec *spec = codec->spec;
-
 	ae7_setup_defaults(codec);
-
-	/*
-	 * The AE-9 has an external DAC (breakout box) connected via
-	 * GPIO 5 (ExternalDACReset_Pin) and GPIO 4 (HPAMP_SHDNPin).
-	 * These must be toggled to power on the DAC, same as the AE-5.
-	 */
-	ca0113_mmio_gpio_set(codec, 5, false);
-	ca0113_mmio_gpio_set(codec, 4, true);
-	ca0113_mmio_gpio_set(codec, 5, true);
-	codec_info(codec, "AE-9: GPIO 4+5 set (DAC power on)\n");
-
-	/*
-	 * Defer ACM init by 3 seconds. The ACM uses verb 0x707
-	 * (VENDOR_CHIPIO_8051_DATA_WRITE) which is shared with the
-	 * DSP 8051 microcontroller. Sending ACM bytes too early
-	 * conflicts with DSP init verbs and crashes the codec.
-	 */
-	/* schedule_delayed_work(&spec->ae9_acm_work,
-			      msecs_to_jiffies(3000)); */
+	ae9_acm_init(codec);
 }
 
 /*
@@ -9546,15 +9595,36 @@ static void ca0132_mmio_init_ae5(struct hda_codec *codec)
 	for (i = 0; i < count; i++) {
 		/*
 		 * AE-7/AE-9 share all writes with the AE-5, except that
-		 * they write a different value to 0x20c.
+		 * they write a different value to index 21 (0x20c).
 		 */
 		if (i == 21 && (ca0132_quirk(spec) == QUIRK_AE7 ||
 				ca0132_quirk(spec) == QUIRK_AE9)) {
 			writel(0x00800001, spec->mem_base + addr[i]);
+			readl(spec->mem_base + addr[i]);
 			continue;
 		}
 
+		/*
+		 * AE-9: skip indices 23-35 (I2C registers 0xc00-0xc0c).
+		 *
+		 * On the AE-5 these writes perform an I2C bus init sequence.
+		 * On the AE-9, writing to STATUS (0xc0c) or any I2C register
+		 * while the ACM module is idle corrupts the I2C bus state and
+		 * prevents ae9_acm_init() from communicating with the ACM.
+		 * Index 36 (0x01c) is safe and must still execute.
+		 *
+		 * ae9_acm_init() performs the proper I2C init once the
+		 * DSP is loaded and the ACM has had time to boot.
+		 */
+		if (ca0132_quirk(spec) == QUIRK_AE9 && i >= 23 && i <= 35)
+			continue;
+
 		writel(data[i], spec->mem_base + addr[i]);
+		/*
+		 * Read-back after every write forces the PCI bus to complete
+		 * the write transaction before the next one begins.
+		 */
+		readl(spec->mem_base + addr[i]);
 	}
 
 	if (ca0132_quirk(spec) == QUIRK_AE5)
@@ -9872,7 +9942,6 @@ static void ca0132_free(struct hda_codec *codec)
 	}
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
-	cancel_delayed_work_sync(&spec->ae9_acm_work);
 	snd_hda_power_up(codec);
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
@@ -9925,7 +9994,6 @@ static int ca0132_suspend(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
-	cancel_delayed_work_sync(&spec->ae9_acm_work);
 	return 0;
 }
 
@@ -10202,7 +10270,7 @@ static int ca0132_codec_probe(struct hda_codec *codec, const struct hda_device_i
 	struct ca0132_spec *spec;
 	int err;
 
-	/* Allow all codecs to probe on AE-9 (dual-codec card) */
+	/* Skip second codec on AE-5/AE-7/AE-9 cards - only D1 is used */
 	if (codec->addr >= 2) {
 		codec_dbg(codec, "ca0132: skipping secondary codec at addr %d\n", codec->addr);
 		return -ENODEV;
@@ -10301,7 +10369,6 @@ static int ca0132_codec_probe(struct hda_codec *codec, const struct hda_device_i
 	spec->base_exit_verbs = ca0132_base_exit_verbs;
 
 	INIT_DELAYED_WORK(&spec->unsol_hp_work, ca0132_unsol_hp_delayed);
-	INIT_DELAYED_WORK(&spec->ae9_acm_work, ae9_acm_delayed_init);
 
 	ca0132_init_chip(codec);
 

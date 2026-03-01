@@ -1,0 +1,14 @@
+=== RÉSUMÉ SYSTÈME COMPLET ===
+
+Carte mère: MSI X470 GAMING PRO CARBON (MS-7B78)
+CPU: AMD Ryzen 7 5700X3D 8-Core (Zen 3)
+RAM: 16GB DDR4 2133MT/s (2x8GB)
+BIOS: AMI 2.J5 (09/12/2025)
+Slots PCIe occupés:
+- J6B2 x16: AMD RX 6700 XT (PCIe 4.0)
+- J6B1 x1: Creative AE-9 (PCIe 3.0, 00:1c.3 → 25:00.0)
+- J3707 x4: Intel 82599 10GbE
+
+Fichiers disponibles dans le projet:
+- lspci-v_ae9.txt: détection complète PCI
+- bios_dump.txt: dmidecode complet (SMBIOS)
