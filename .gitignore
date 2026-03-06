@@ -13,3 +13,10 @@ Module.symvers
 linux-*.tar.xz
 linux-source/
 linux-6*/
+build/.*.cmd
+build/*.o
+build/*.mod
+build/*.mod.c
+build/*.mod.o
+build/Module.symvers
+build/modules.order
