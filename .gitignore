@@ -1,22 +1,10 @@
-*.o
-*.ko
-*.mod
-*.mod.c
-*.mod.o
-*.bak
-*.cmd
-*.symvers
-*.order
-.tmp_versions/
-modules.order
-Module.symvers
-linux-*.tar.xz
-linux-source/
-linux-6*/
-build/.*.cmd
+# Build artifacts — never track these
 build/*.o
 build/*.mod
 build/*.mod.c
 build/*.mod.o
-build/Module.symvers
+build/.*.cmd
+build/*.symvers
 build/modules.order
+build/.gitignore
+build/snd-hda-codec-ca0132.ko
