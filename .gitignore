@@ -8,3 +8,9 @@ build/*.symvers
 build/modules.order
 build/.gitignore
 build/snd-hda-codec-ca0132.ko
+linux-6.17.tar.xz
+linux-source/
+*.hda
+*.payload
+*.bin
+*.ko

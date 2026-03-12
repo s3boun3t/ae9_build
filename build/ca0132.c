@@ -753,6 +753,20 @@ static const struct ae_ca0113_output_set ae7_ca0113_output_presets = {
 		    { 0x3f, 0x3f, 0x00, 0x00, 0x02, 0x00 } },
 };
 
+/*
+ * AE-9 MMIO output presets — 4 commands (not 6 like AE-5/AE-7).
+ * Source: patch 0008 (Connor McAdams).
+ * group/target/vals confirmed from Windows INF analysis.
+ */
+static const struct ae_ca0113_output_set ae9_ca0113_output_presets = {
+	.group  = { 0x48, 0x48, 0x48, 0x48, 0x00, 0x00 },
+	.target = { 0x1d, 0x0d, 0x17, 0x19, 0x00, 0x00 },
+		    /* Speakers. */
+	.vals   = { { 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 },
+		    /* Headphones. */
+		    { 0x80, 0x40, 0x00, 0x00, 0x00, 0x00 } },
+};
+
 /* ae5 ca0113 command sequences to set headphone gain levels. */
 #define AE5_HEADPHONE_GAIN_PRESET_MAX_COMMANDS 4
 struct ae5_headphone_gain_set {
@@ -1138,6 +1152,7 @@ struct ca0132_spec {
 	bool is_d2_acm_only;            /* true if this spec belongs to D2    */
 	struct delayed_work unsol_hp_work;
 	struct delayed_work ae9_acm_work;
+	struct delayed_work ae9_hb_work;  /* ACM heartbeat loop */
 	bool ae9_acm_init_done; /* true after ACM worker has run once */
 
 #ifdef ENABLE_TUNING_CONTROLS
@@ -1308,14 +1323,25 @@ static const struct hda_pintbl ae7_pincfgs[] = {
  *  - 0x13: What U Hear In (same as AE-7: 0x908700f0)
  */
 static const struct hda_pintbl ae9_pincfgs[] = {
-	{ 0x0b, 0x01017010 }, /* Port G: Line Out Front L/R */
-	{ 0x0c, 0x414510f0 }, /* SPDIF Out: not connected */
+	/*
+	 * Pin configs for AE-9 (SSID 11020071).
+	 *
+	 * Critical: 0x0f must use DefAssoc=2 (separate group from line_outs
+	 * which use Assoc=1) so HDA autoconfig classifies it as hp_outs[0].
+	 * With Assoc=1 it conflicts with 0x0b and ends up in line_outs.
+	 *
+	 * 0x0f: Jack, Rear, HP Out, 1/8-jack, Black, Assoc=2, Seq=0
+	 * 0x0b: Jack, Int, Line Out, 1/8-jack, Green, Assoc=1, Seq=0
+	 * 0x11: Not-connected (it is LineMicIn2 on AE-9, not a HP jack)
+	 */
+	{ 0x0b, 0x01014110 }, /* Port G: Line Out (Assoc=1) */
+	{ 0x0c, 0x014510f0 }, /* SPDIF Out 1 */
 	{ 0x0d, 0x414510f0 }, /* SPDIF Out 2: not connected */
 	{ 0x0e, 0x01c520f0 }, /* SPDIF In */
-	{ 0x0f, 0x01017114 }, /* Port A: Rear L/R, detect override */
-	{ 0x10, 0x01017011 }, /* Port D: Center/LFE or FP HP */
-	{ 0x11, 0x41a170ff }, /* Port B: BackPanel HP / LineMicIn2 */
-	{ 0x12, 0x01a170f0 }, /* Port C: LineMicIn1 / Mic-In */
+	{ 0x0f, 0x02214020 }, /* Port A: HP Out (ACM jack, Assoc=2, Seq=0) */
+	{ 0x10, 0x01016011 }, /* Port D: Center/LFE or FP HP */
+	{ 0x11, 0x41013014 }, /* Port B: not-connected (LineMicIn2) */
+	{ 0x12, 0x01a190f0 }, /* Port C: Mic-In / LineIn1 */
 	{ 0x13, 0x908700f0 }, /* What U Hear In */
 	{ 0x18, 0x500000f0 }, /* N/A */
 	{}
@@ -1548,6 +1574,29 @@ static const struct ca0132_alt_out_set_quirk_data quirk_out_set_data[] = {
 		  .has_chipio_write  = true,
 		  .chipio_write_addr = 0x0018b03c,
 		  .chipio_write_data = 0x00000010
+		} },
+	},
+	{ .quirk_id = QUIRK_AE9,
+	  .has_headphone_gain = true,
+	  .is_ae_series       = true,
+	  .out_set_info = {
+		/* Speakers. */
+		{ .dac2port          = 0xa4,
+		  .has_hda_gpio      = false,
+		  .mmio_gpio_count   = 1,
+		  .mmio_gpio_pin     = { 3 },
+		  .mmio_gpio_set     = { 1 },
+		  .scp_cmds_count    = 0,
+		  .has_chipio_write  = false,
+		},
+		/* Headphones. */
+		{ .dac2port          = 0xa1,
+		  .has_hda_gpio      = false,
+		  .mmio_gpio_count   = 1,
+		  .mmio_gpio_pin     = { 3 },
+		  .mmio_gpio_set     = { 0 },
+		  .scp_cmds_count    = 0,
+		  .has_chipio_write  = false,
 		} },
 	}
 };
@@ -3936,7 +3985,35 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	codec_info(codec,
+		   "AE-9 DEBUG: pcm_prepare dac=0x%02x tag=%u fmt=0x%04x\n",
+		   spec->dacs[0], stream_tag, format);
+
 	snd_hda_codec_setup_stream(codec, spec->dacs[0], stream_tag, 0, format);
+
+	/* AE-9 DEBUG: verify what was actually written to NID 0x02 */
+	{
+		unsigned int v_stream = snd_hda_codec_read(codec, spec->dacs[0],
+						0, AC_VERB_GET_CONV, 0);
+		unsigned int v_format = snd_hda_codec_read(codec, spec->dacs[0],
+						0, AC_VERB_GET_STREAM_FORMAT, 0);
+		unsigned int v_power  = snd_hda_codec_read(codec, spec->dacs[0],
+						0, AC_VERB_GET_POWER_STATE, 0);
+		codec_info(codec,
+			   "AE-9 DEBUG: NID 0x02 post-setup: "
+			   "CONV=0x%02x FMT=0x%04x PWR=0x%02x\n",
+			   v_stream, v_format, v_power);
+	}
+/* AE-9: re-enable stream 0x11 (HDA DMA -> DSP input).
+	 * pcm_cleanup stops it, but it must be active for the DSP
+	 * to receive audio. NID 0x15 / StreamID 5 are pre-configured
+	 * at init and must not be reprogrammed here.
+	 */
+	 if (ca0132_quirk(spec) == QUIRK_AE9) {
+		mutex_lock(&spec->chipio_mutex);
+		chipio_set_stream_control(codec, 0x11, 1);
+		mutex_unlock(&spec->chipio_mutex);
+    }
 
 	return 0;
 }
@@ -3946,6 +4023,23 @@ static int ca0132_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
 			struct snd_pcm_substream *substream)
 {
 	struct ca0132_spec *spec = codec->spec;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		unsigned int ctrl_0c = 0, ctrl_18 = 0;
+
+		mutex_lock(&spec->chipio_mutex);
+		chipio_get_stream_control(codec, 0x0c, &ctrl_0c);
+		chipio_get_stream_control(codec, 0x18, &ctrl_18);
+		mutex_unlock(&spec->chipio_mutex);
+		codec_info(codec,
+			   "AE-9 DEBUG: pcm_cleanup 0x0c=%u 0x18=%u\n",
+			   ctrl_0c, ctrl_18);
+
+/* Stop stream 0x11 (HDA DMA -> DSP) on cleanup */
+		mutex_lock(&spec->chipio_mutex);
+		chipio_set_stream_control(codec, 0x11, 0);
+		mutex_unlock(&spec->chipio_mutex);
+	}
 
 	if (spec->dsp_state == DSP_DOWNLOADING)
 		return 0;
@@ -4594,14 +4688,21 @@ static void ae5_mmio_select_out(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	const struct ae_ca0113_output_set *out_cmds;
-	unsigned int i;
+	unsigned int i, cmd_cnt;
 
-	if (ca0132_quirk(spec) == QUIRK_AE5)
+	if (ca0132_quirk(spec) == QUIRK_AE5) {
 		out_cmds = &ae5_ca0113_output_presets;
-	else
+		cmd_cnt  = AE_CA0113_OUT_SET_COMMANDS;
+	} else if (ca0132_quirk(spec) == QUIRK_AE9) {
+		/* AE-9 uses only 4 MMIO commands (patch 0008). */
+		out_cmds = &ae9_ca0113_output_presets;
+		cmd_cnt  = 4;
+	} else {
 		out_cmds = &ae7_ca0113_output_presets;
+		cmd_cnt  = AE_CA0113_OUT_SET_COMMANDS;
+	}
 
-	for (i = 0; i < AE_CA0113_OUT_SET_COMMANDS; i++)
+	for (i = 0; i < cmd_cnt; i++)
 		ca0113_mmio_command_set(codec, out_cmds->group[i],
 				out_cmds->target[i],
 				out_cmds->vals[spec->cur_out_type][i]);
@@ -4749,6 +4850,8 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 		}
 	}
 
+	codec_info(codec, "AE-9 select_out: dac2port=0x%02x\n",
+		   out_info->dac2port);
 	chipio_set_control_param(codec, 0x0d, out_info->dac2port);
 
 	if (out_info->has_chipio_write) {
@@ -4807,6 +4910,8 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 	hda_nid_t headphone_nid = spec->out_pins[1];
 
 	codec_dbg(codec, "%s\n", __func__);
+	codec_info(codec, "AE-9 select_out: enter, dsp_state=%d\n",
+		   spec->dsp_state);
 
 	snd_hda_power_up_pm(codec);
 
@@ -4817,7 +4922,15 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 	 * If neither is plugged in, set to rear line out. Only if
 	 * hp/speaker auto detect is enabled.
 	 */
-	if (auto_jack) {
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		/*
+		 * AE-9: headphones live on the external ACM breakout box.
+		 * The CA0132 jack-sense pins cannot detect insertion there,
+		 * so auto-detect always yields SPEAKER_OUT (wrong).
+		 * Force HEADPHONE_OUT unconditionally.
+		 */
+		spec->cur_out_type = HEADPHONE_OUT;
+	} else if (auto_jack) {
 		jack_present = snd_hda_jack_detect(codec, spec->unsol_tag_hp) ||
 			   snd_hda_jack_detect(codec, spec->unsol_tag_front_hp);
 
@@ -4832,11 +4945,14 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 
 	/* Begin DSP output switch, mute DSP volume. */
 	err = dspio_set_uint_param(codec, 0x96, SPEAKER_TUNING_MUTE, FLOAT_ONE);
+	codec_info(codec, "AE-9 select_out: MUTE err=%d, cur_out=%d\n",
+		   err, spec->cur_out_type);
 	if (err < 0)
 		goto exit;
 
 	if (ca0132_alt_select_out_quirk_set(codec) < 0)
 		goto exit;
+	codec_info(codec, "AE-9 select_out: quirk_set done\n");
 
 	switch (spec->cur_out_type) {
 	case SPEAKER_OUT:
@@ -4881,17 +4997,41 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 		ca0132_set_out_node_pincfg(codec, spec->out_pins[3], 0, 0);
 
 		/* enable headphone, either front or rear */
-		if (snd_hda_jack_detect(codec, spec->unsol_tag_front_hp))
-			headphone_nid = spec->out_pins[2];
-		else if (snd_hda_jack_detect(codec, spec->unsol_tag_hp))
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			/*
+			 * AE-9: the ACM board has no jack-sense hardware on
+			 * NID 0x0f (jack_detect always returns 0). Always
+			 * route to out_pins[1] (0x0f = ACM headphone jack).
+			 */
 			headphone_nid = spec->out_pins[1];
+		} else if (snd_hda_jack_detect(codec, spec->unsol_tag_front_hp)) {
+			headphone_nid = spec->out_pins[2];
+		} else if (snd_hda_jack_detect(codec, spec->unsol_tag_hp)) {
+			headphone_nid = spec->out_pins[1];
+		}
 
 		ca0132_set_out_node_pincfg(codec, headphone_nid, 1, 1);
+		{
+			unsigned int _pc = snd_hda_codec_read(codec,
+					headphone_nid, 0,
+					AC_VERB_GET_PIN_WIDGET_CONTROL, 0);
+			codec_info(codec,
+				   "AE-9 select_out: pin 0x%02x pin-ctls=0x%02x\n",
+				   headphone_nid, _pc);
+		}
 
-		if (outfx_set)
+		/*
+		 * AE-9: the external DAC (CS43198) has no DSP bypass path.
+		 * Always send FLOAT_ONE so the DSP passes signal through,
+		 * regardless of whether PlayEnhancement is enabled.
+		 */
+		if (outfx_set || ca0132_quirk(spec) == QUIRK_AE9)
 			err = dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ONE);
 		else
 			err = dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ZERO);
+		codec_info(codec,
+			   "AE-9 select_out: dspio 0x80/0x04 err=%d outfx=%d\n",
+			   err, outfx_set);
 
 		if (err < 0)
 			goto exit;
@@ -4927,6 +5067,7 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 		err = ca0132_alt_surround_set_bass_redirection(codec, 0);
 
 	/* Unmute DSP now that we're done with output selection. */
+	codec_info(codec, "AE-9 select_out: about to unmute\n");
 	err = dspio_set_uint_param(codec, 0x96,
 			SPEAKER_TUNING_MUTE, FLOAT_ZERO);
 	if (err < 0)
@@ -4984,6 +5125,100 @@ static void ca0132_unsol_hp_delayed(struct work_struct *work)
 static int ae9_acm_init(struct hda_codec *d1, struct hda_codec *d2);
 static struct hda_codec *ae9_find_d2_codec(struct hda_codec *d1);
 
+/* Forward declaration — ae9_i2c_send is defined later in this file */
+static void ae9_i2c_send(struct hda_codec *d1, const char *name,
+			  const u8 *data, int len);
+
+/*
+ * ae9_acm_heartbeat - one 16-TX maintenance cycle for the ACM board.
+ *
+ * The VFIO capture shows the Windows driver sends this cycle continuously
+ * after init (6083 total TX = ~380 iterations in the capture window).
+ * The MCU requires periodic messaging to stay active; without it the DAC
+ * board powers off within seconds.
+ *
+ * Cycle structure (derived from VFIO TX#175-TX#190):
+ *   reset + hs_fwd + hs_rev + cfg + stchk + query +
+ *   out1 x2 + out2 + insel + out1 + out2 + dac1 + dac2 + dac3 + label
+ *
+ * The label (display text) reflects current output selection.
+ */
+static void ae9_acm_heartbeat(struct hda_codec *d1)
+{
+	struct ca0132_spec *spec = d1->spec;
+	/* Fixed cycle packets (from VFIO) */
+	static const u8 hb_reset[]  = {0x81, 0x00};
+	static const u8 hb_hsfwd[]  = {0x54, 0x04, 0x41, 0x63, 0x6d, 0x31};
+	static const u8 hb_hsrev[]  = {0x54, 0x04, 0x31, 0x6d, 0x63, 0x41};
+	static const u8 hb_cfg[]    = {0xd5, 0x03, 0x00, 0x20, 0x04};
+	static const u8 hb_stchk[]  = {0x54, 0x04, 0x11, 0x11, 0x11, 0x11};
+	static const u8 hb_query[]  = {0xc2, 0x00};
+	static const u8 hb_out1[]   = {0x83, 0x01, 0x02};
+	static const u8 hb_out2[]   = {0x83, 0x01, 0x07};
+	static const u8 hb_insel[]  = {0x85, 0x01, 0x02};
+	static const u8 hb_dac1[]   = {0xb1, 0x01, 0x01};
+	static const u8 hb_dac2[]   = {0xb1, 0x01, 0x02};
+	static const u8 hb_dac3[]   = {0xb1, 0x01, 0x03};
+	/* Display label: "-15.0" for line-out, "-HP-" for headphone */
+	static const u8 hb_label_hp[]  = {
+		0x11, 0x09, 0x2d, 0x48, 0x50, 0x2d,
+		0x00, 0x00, 0x00, 0x00, 0x00};
+	static const u8 hb_label_15[]  = {
+		0x11, 0x09, 0x2d, 0x31, 0x35, 0x2e, 0x30,
+		0x00, 0x00, 0x00, 0x00, 0x00};
+	const u8 *label;
+	int label_len;
+
+	if (spec->cur_out_type == HEADPHONE_OUT) {
+		label = hb_label_hp;
+		label_len = ARRAY_SIZE(hb_label_hp);
+	} else {
+		label = hb_label_15;
+		label_len = ARRAY_SIZE(hb_label_15);
+	}
+
+	ae9_i2c_send(d1, "hb_reset",  hb_reset,  ARRAY_SIZE(hb_reset));
+	ae9_i2c_send(d1, "hb_hsfwd",  hb_hsfwd,  ARRAY_SIZE(hb_hsfwd));
+	ae9_i2c_send(d1, "hb_hsrev",  hb_hsrev,  ARRAY_SIZE(hb_hsrev));
+	ae9_i2c_send(d1, "hb_cfg",    hb_cfg,    ARRAY_SIZE(hb_cfg));
+	ae9_i2c_send(d1, "hb_stchk",  hb_stchk,  ARRAY_SIZE(hb_stchk));
+	ae9_i2c_send(d1, "hb_query",  hb_query,  ARRAY_SIZE(hb_query));
+	ae9_i2c_send(d1, "hb_out1a",  hb_out1,   ARRAY_SIZE(hb_out1));
+	ae9_i2c_send(d1, "hb_out1b",  hb_out1,   ARRAY_SIZE(hb_out1));
+	ae9_i2c_send(d1, "hb_out2a",  hb_out2,   ARRAY_SIZE(hb_out2));
+	ae9_i2c_send(d1, "hb_insel",  hb_insel,  ARRAY_SIZE(hb_insel));
+	ae9_i2c_send(d1, "hb_out1c",  hb_out1,   ARRAY_SIZE(hb_out1));
+	ae9_i2c_send(d1, "hb_out2b",  hb_out2,   ARRAY_SIZE(hb_out2));
+	ae9_i2c_send(d1, "hb_dac1",   hb_dac1,   ARRAY_SIZE(hb_dac1));
+	ae9_i2c_send(d1, "hb_dac2",   hb_dac2,   ARRAY_SIZE(hb_dac2));
+	ae9_i2c_send(d1, "hb_dac3",   hb_dac3,   ARRAY_SIZE(hb_dac3));
+	ae9_i2c_send(d1, "hb_label",  label,     label_len);
+}
+
+/*
+ * ca0132_ae9_hb_work - periodic ACM heartbeat worker.
+ *
+ * Runs every 100ms after ACM init to keep the DAC board active.
+ * Re-schedules itself unless the codec is being freed.
+ */
+static void ca0132_ae9_hb_work(struct work_struct *work)
+{
+	struct ca0132_spec *spec = container_of(
+		to_delayed_work(work), struct ca0132_spec, ae9_hb_work);
+	struct hda_codec *codec = spec->codec;
+
+	if (!spec->ae9_acm_init_done || !spec->d2_codec)
+		return;
+
+	snd_hda_power_up(codec);
+	ae9_acm_heartbeat(codec);
+	snd_hda_power_down(codec);
+
+	/* Reschedule — 100ms matches Windows driver polling rate */
+	/* DEBUG: heartbeat disabled to test if it causes audio silence */
+	/* schedule_delayed_work(&spec->ae9_hb_work, msecs_to_jiffies(100)); */
+}
+
 static void ca0132_ae9_acm_delayed(struct work_struct *work)
 {
 	struct ca0132_spec *spec = container_of(
@@ -5029,6 +5264,9 @@ static void ca0132_ae9_acm_delayed(struct work_struct *work)
 	snd_hda_power_up(codec);
 	ae9_acm_init(codec, d2);
 	snd_hda_power_down(codec);
+
+	/* Start periodic heartbeat to keep DAC board active */
+	schedule_delayed_work(&spec->ae9_hb_work, msecs_to_jiffies(100));
 }
 
 static void ca0132_set_dmic(struct hda_codec *codec, int enable);
@@ -7375,11 +7613,60 @@ static int dbpro_build_controls(struct hda_codec *codec)
 /*
  * PCM
  */
+
+/*
+ * AE-9 playback open: set hardware constraints.
+ *
+ * NID 0x02 reports no PCM capabilities (param 0x06 = 0x0) because the
+ * CA0132 DSP handles all sample-rate conversion. Without explicit
+ * constraints the HDA core leaves buffer_size_max at 1048576 frames,
+ * causing a 4 MB DMA allocation that fails with -ENOMEM before the
+ * stream can start. Cap buffer and period sizes to sensible values.
+ */
+static int ae9_playback_pcm_open(struct hda_pcm_stream *hinfo,
+				 struct hda_codec *codec,
+				 struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_hardware *hw = &substream->runtime->hw;
+
+	/* Constrain to what the DSP pipeline actually supports. */
+	hw->rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
+		    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000;
+	hw->formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE |
+		      SNDRV_PCM_FMTBIT_S32_LE;
+	hw->channels_min = 2;
+	hw->channels_max = 6;
+
+	/*
+	 * Limit DMA buffer size to avoid -ENOMEM on contiguous allocation.
+	 * 16384 frames @ 48kHz/16bit/2ch = 64 kB, well within limits.
+	 */
+	hw->buffer_bytes_max = 65536;
+	hw->period_bytes_min = 256;
+	hw->period_bytes_max = 16384;
+	hw->periods_min = 2;
+	hw->periods_max = 8;
+
+	return 0;
+}
+
 static const struct hda_pcm_stream ca0132_pcm_analog_playback = {
 	.substreams = 1,
 	.channels_min = 2,
 	.channels_max = 6,
 	.ops = {
+		.prepare = ca0132_playback_pcm_prepare,
+		.cleanup = ca0132_playback_pcm_cleanup,
+		.get_delay = ca0132_playback_pcm_delay,
+	},
+};
+
+static const struct hda_pcm_stream ae9_pcm_analog_playback = {
+	.substreams = 1,
+	.channels_min = 2,
+	.channels_max = 6,
+	.ops = {
+		.open    = ae9_playback_pcm_open,
 		.prepare = ca0132_playback_pcm_prepare,
 		.cleanup = ca0132_playback_pcm_cleanup,
 		.get_delay = ca0132_playback_pcm_delay,
@@ -7436,7 +7723,17 @@ static int ca0132_build_pcms(struct hda_codec *codec)
 		info->stream[SNDRV_PCM_STREAM_PLAYBACK].chmap
 			= ca0132_alt_chmaps;
 	}
-	info->stream[SNDRV_PCM_STREAM_PLAYBACK] = ca0132_pcm_analog_playback;
+	/*
+	 * AE-9: use a dedicated stream descriptor with an .open callback
+	 * that sets hardware constraints (rates, formats, buffer limits).
+	 * NID 0x02 reports no PCM caps so the HDA core cannot derive them
+	 * from hardware; without buffer_bytes_max the allocation reaches
+	 * 4 MB and fails with -ENOMEM before the stream can start.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		info->stream[SNDRV_PCM_STREAM_PLAYBACK] = ae9_pcm_analog_playback;
+	else
+		info->stream[SNDRV_PCM_STREAM_PLAYBACK] = ca0132_pcm_analog_playback;
 	info->stream[SNDRV_PCM_STREAM_PLAYBACK].nid = spec->dacs[0];
 	info->stream[SNDRV_PCM_STREAM_PLAYBACK].channels_max =
 		spec->multiout.max_channels;
@@ -7747,9 +8044,23 @@ static void ca0132_alt_free_active_dma_channels(struct hda_codec *codec)
  */
 static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 {
+	/*
+	 * AE-9 uses stream 0x05 (HDA node 0x02 → DSP) instead of 0x03/0x04.
+	 * Stream 0x05 must be started so the DSP DMA channel is active and
+	 * the HDA controller can transfer audio into the DSP input FIFO.
+	 * Without it, hw_ptr never advances (tstamp=0, delay >> buffer).
+	 */
 	static const unsigned int dsp_dma_stream_ids[] = { 0x0c, 0x03, 0x04 };
+	static const unsigned int ae9_dma_stream_ids[] = { 0x0c };	/* 0x05 started after stream_setup */
+	const unsigned int *stream_ids = dsp_dma_stream_ids;
+	unsigned int n_streams = n_streams;
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int i, tmp;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		stream_ids = ae9_dma_stream_ids;
+		n_streams  = ARRAY_SIZE(ae9_dma_stream_ids);
+	}
 
 	/*
 	 * Check if any of the default streams are active, and if they are,
@@ -7757,12 +8068,12 @@ static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 	 */
 	mutex_lock(&spec->chipio_mutex);
 
-	for (i = 0; i < ARRAY_SIZE(dsp_dma_stream_ids); i++) {
-		chipio_get_stream_control(codec, dsp_dma_stream_ids[i], &tmp);
+	for (i = 0; i < n_streams; i++) {
+		chipio_get_stream_control(codec, stream_ids[i], &tmp);
 
 		if (tmp) {
 			chipio_set_stream_control(codec,
-					dsp_dma_stream_ids[i], 0);
+					stream_ids[i], 0);
 		}
 	}
 
@@ -7780,9 +8091,9 @@ static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 	/* Make sure stream 0x0c is six channels. */
 	chipio_set_stream_channels(codec, 0x0c, 6);
 
-	for (i = 0; i < ARRAY_SIZE(dsp_dma_stream_ids); i++) {
+	for (i = 0; i < n_streams; i++) {
 		chipio_set_stream_control(codec,
-				dsp_dma_stream_ids[i], 1);
+				stream_ids[i], 1);
 
 		/* Give the DSP some time to setup the DMA channel. */
 		msleep(75);
@@ -8383,13 +8694,27 @@ static void ae9_post_dsp_mmio_commands(struct hda_codec *codec)
 static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 				      bool start_stream)
 {
-	chipio_set_stream_source_dest(codec, 0x05, 0x43, 0x00);
-	if (!start_stream)
+	/*
+	 * AE-9: only configure stream 0x05 src/dst on first call.
+	 * Same protection as stream 0x18 — calling set_stream_source_dest
+	 * on an active stream resets the 8051 exram allocation (offset→0xff).
+	 */
+	if (start_stream)
+		chipio_set_stream_source_dest(codec, 0x05, 0x43, 0x00);
+	else
 		ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x37);
 
-	chipio_set_stream_source_dest(codec, 0x18, 0x09, 0xd0);
-	if (!start_stream)
+	/*
+	 * AE-9: only configure stream 0x18 src/dst on first call (start_stream).
+	 * On the second call (!start_stream) the 8051 has already allocated the
+	 * exram entry for 0x18 — calling set_stream_source_dest again resets the
+	 * 8051 allocation (exram offset returns 0xff) and silences the I2S DAC.
+	 */
+	if (start_stream) {
+		chipio_set_stream_source_dest(codec, 0x18, 0x09, 0xd0);
+	} else {
 		ca0113_mmio_command_set(codec, 0x48, 0x10, 0x37);
+	}
 
 	chipio_set_conn_rate_no_mutex(codec, 0xd0, SR_96_000);
 	chipio_set_stream_channels(codec, 0x18, 6);
@@ -8423,6 +8748,99 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 
 	ae9_post_dsp_pll_setup(codec);
 	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 0x0f);
+}
+
+/*
+ * ae9_post_dsp_setup_ports - populate the ChipIO audio router for AE-9.
+ *
+ * The audio router at 0x190000 routes DSP output to physical DAC ports.
+ * Each 32-bit entry: bits[15:8]=destination, bits[7:0]=source,
+ * bits[1:0]=active (1=active).
+ *
+ * chipio_remap_stream() reads the stream's starting port offset from
+ * exram 0x1578+stream_id, which the 8051 populates after stream start.
+ * This function must be called AFTER the 8051 has had time to write
+ * that offset — in practice ~200ms after chipio_set_stream_control(0x0c,1).
+ *
+ * Must be called with chipio_mutex held (uses no_mutex internals).
+ * The AE-9 uses stream_remap_data[1] (stream 0x0c, 12 channels),
+ * same layout as AE-7/SBZ.
+ */
+static void ae9_post_dsp_setup_ports(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int exram_val = 0xff;
+
+	/*
+	 * Log the exram offset so we can confirm the 8051 has allocated
+	 * stream 0x0c before attempting the remap.
+	 * 0x1578 + stream_id (0x0c) = 0x1584.
+	 */
+	mutex_lock(&spec->chipio_mutex);
+	chipio_8051_read_exram(codec, 0x1578 + 0x0c, &exram_val);
+	mutex_unlock(&spec->chipio_mutex);
+
+	codec_info(codec,
+		   "AE-9: stream 0x0c exram offset=0x%02x "
+		   "(0xff=not allocated, other=ok)\n", exram_val);
+
+	if (exram_val == 0xff) {
+		codec_warn(codec,
+			   "AE-9: stream 0x0c not yet allocated — "
+			   "audio router remap skipped\n");
+		return;
+	}
+
+	/*
+	 * AE-9 DEBUG: dump the full audio router (0x190000-0x1900fc) BEFORE
+	 * our remap, so we can see what the 8051 initialised by default.
+	 * chipio_read() takes the mutex internally — call outside our lock.
+	 */
+	{
+		unsigned int ae9_pre_val;
+		int ae9_pre_j;
+
+		codec_info(codec, "AE-9: audio router PRE-remap dump:\n");
+		for (ae9_pre_j = 0; ae9_pre_j < 64; ae9_pre_j++) {
+			chipio_read(codec,
+				    0x190000 + (ae9_pre_j * 4),
+				    &ae9_pre_val);
+			if (ae9_pre_val != 0)
+				codec_info(codec,
+					   "AE-9: pre[0x%06x]=0x%08x\n",
+					   0x190000 + (ae9_pre_j * 4),
+					   ae9_pre_val);
+		}
+	}
+
+	mutex_lock(&spec->chipio_mutex);
+
+	/*
+	 * AE-9: do NOT remap stream 0x0c ports. The 8051 default
+	 * sequential mapping (c0→e0, c1→e1, ..., cb→eb) is correct
+	 * for the external CS43198 DAC connected via I2S (stream 0x18).
+	 * stream_remap_data[1] swaps surround/center ports for the
+	 * SBZ/AE-7 internal DAC physical layout — it does not apply
+	 * here and causes DSP stall (delay=2238 > buffer=192).
+	 */
+	codec_info(codec,
+		   "AE-9: skipping stream 0x0c remap "
+		   "(8051 sequential defaults are correct)\n");
+
+	/*
+	 * MMIO volume/gain presets — same block as AE-7 except 0x0d=0x00
+	 * (unity gain on AE-9 vs 0x40 on AE-7).
+	 */
+	ca0113_mmio_command_set(codec, 0x30, 0x30, 0x00);
+	ca0113_mmio_command_set(codec, 0x48, 0x0d, 0x00);
+	ca0113_mmio_command_set(codec, 0x48, 0x17, 0x00);
+	ca0113_mmio_command_set(codec, 0x48, 0x19, 0x00);
+	ca0113_mmio_command_set(codec, 0x48, 0x11, 0xff);
+	ca0113_mmio_command_set(codec, 0x48, 0x12, 0xff);
+	ca0113_mmio_command_set(codec, 0x48, 0x13, 0xff);
+	ca0113_mmio_command_set(codec, 0x48, 0x14, 0x7f);
+
+	mutex_unlock(&spec->chipio_mutex);
 }
 
 static void ae9_post_dsp_asi_setup(struct hda_codec *codec)
@@ -8733,7 +9151,7 @@ static void ae5_setup_defaults(struct hda_codec *codec)
 #define AE9_I2C_DATA		0xc04
 #define AE9_I2C_FIFO		0xc08
 #define AE9_I2C_STATUS		0xc0c	/* command register — written manually */
-#define AE9_I2C_TXSTAT		0xc14	/* TX completion: poll for 0x41 */
+/* NOTE: 0xc14 does NOT appear in the VFIO capture — no per-byte ACK poll */
 #define AE9_ACM_PRESENCE	0xc7c	/* ACM present: 0x06, busy: 0x07/0x03 */
 #define AE9_I2C_GPIO_CTL	0x320	/* I2C GPIO control */
 
@@ -8742,8 +9160,7 @@ static void ae5_setup_defaults(struct hda_codec *codec)
 #define AE9_I2C_STATUS_READY	0x03	/* bus ready */
 #define AE9_I2C_STATUS_ACM_UP	0x83	/* MCU firmware running */
 
-/* AE9_I2C_TXSTAT completion flag (poll after each CMD byte write) */
-#define AE9_TXSTAT_DONE		0x41
+
 
 /* AE9_I2C_GPIO_CTL value written before packet TX */
 #define AE9_I2C_GPIO_INIT	0x0105
@@ -8770,62 +9187,14 @@ static struct hda_codec *ae9_find_d2_codec(struct hda_codec *d1)
 }
 
 /*
- * ae9_i2c_wait_byte - wait for the I2C controller to accept one byte.
- *
- * After each byte written to I2C_CMD the controller sets AE9_I2C_TXSTAT
- * to 0x41 and AE9_ACM_PRESENCE to 0x0f.  Both must be seen before the
- * next byte is written.  Confirmed from VFIO trace: each CMD write is
- * followed by alternating reads of 0xc14 / 0xc7c until c14=0x41, c7c=0x0f.
- *
- * Returns 0 on success, -ETIMEDOUT if the controller stalls.
- */
-static int ae9_i2c_wait_byte(struct hda_codec *d1)
-{
-	struct ca0132_spec *spec = d1->spec;
-	void __iomem *base = spec->mem_base;
-	int retries = 200;
-	u32 txs, pres;
-
-	do {
-		txs  = readl(base + AE9_I2C_TXSTAT)    & 0xff;
-		pres = readl(base + AE9_ACM_PRESENCE)  & 0xff;
-		if (txs == AE9_TXSTAT_DONE && pres == 0x0f)
-			return 0;
-		udelay(10);
-	} while (--retries > 0);
-
-	codec_warn(d1,
-		   "AE-9 I2C: byte-ack timeout (c14=0x%02x c7c=0x%02x)\n",
-		   txs, pres);
-	return -ETIMEDOUT;
-}
-
-/*
- * ae9_i2c_write_byte - write one byte to I2C_CMD and wait for ACK.
- *
- * The VFIO trace shows a readback of I2C_CMD after the ACK pair to
- * confirm the byte was forwarded to the I2C bus.
- */
-static void ae9_i2c_write_byte(struct hda_codec *d1, u8 byte)
-{
-	struct ca0132_spec *spec = d1->spec;
-	void __iomem *base = spec->mem_base;
-
-	writel(byte, base + AE9_I2C_CMD);
-	/* readback I2C_CMD immediately after write (matches VFIO trace) */
-	readl(base + AE9_I2C_CMD);
-	ae9_i2c_wait_byte(d1);
-	/* read CMD again after ACK — controller echoes forwarded byte */
-	readl(base + AE9_I2C_CMD);
-}
-
-/*
  * ae9_i2c_send - send one ACM command packet via CA0113 I2C MMIO.
  *
- * Packet format confirmed from VFIO trace (lines 64,180+):
- *   WRITE CMD=0xf0  (start-of-packet) + per-byte ACK poll
- *   WRITE CMD=byte0..byteN             + per-byte ACK poll each
- *   WRITE CMD=0xf7  (end-of-transaction, 6083× in full capture)
+ * The VFIO capture contains ONLY sequential I2C_CMD writes with no
+ * per-byte ACK polling (register 0xc14 never appears in the trace).
+ * The Windows driver writes bytes in a tight loop, no inter-byte delay.
+ *
+ * Packet format: 0xf0 start | payload bytes | 0xf7 end-of-transaction.
+ * Each writel is followed by one readl (read-after-write, bus ordering).
  *
  * @name:  debug label
  * @data:  packet payload (NOT including 0xf0 or 0xf7)
@@ -8834,107 +9203,138 @@ static void ae9_i2c_write_byte(struct hda_codec *d1, u8 byte)
 static void ae9_i2c_send(struct hda_codec *d1, const char *name,
 			  const u8 *data, int len)
 {
+	struct ca0132_spec *spec = d1->spec;
+	void __iomem *base = spec->mem_base;
 	int i;
 
-	ae9_i2c_write_byte(d1, 0xf0);		/* start-of-packet */
-	for (i = 0; i < len; i++)
-		ae9_i2c_write_byte(d1, data[i]);
-	ae9_i2c_write_byte(d1, 0xf7);		/* end-of-transaction */
+	/* start-of-packet marker (0xf0) */
+	writel(0xf0, base + AE9_I2C_CMD);
+	readl(base + AE9_I2C_CMD);
 
-	codec_dbg(d1, "AE-9 ACM I2C: sent '%s' (%d bytes)\n", name, len);
+	for (i = 0; i < len; i++) {
+		writel(data[i], base + AE9_I2C_CMD);
+		readl(base + AE9_I2C_CMD);
+	}
+
+
+	/*
+	 * End-of-packet terminator 0xf7, confirmed in ae9_stream_descriptor_init.txt
+	 * raw VFIO trace: every TX ends with W[0xc00]=0xf7 / R[0xc00]=0xf7.
+	 * ae9_init_unique_transactions.txt omits the terminator (processed view);
+	 * the raw trace is authoritative.
+	 */
+	writel(0xf7, base + AE9_I2C_CMD);
+	readl(base + AE9_I2C_CMD);
+
+	usleep_range(500, 1000);		/* inter-packet gap */
+	codec_info(d1, "AE-9 ACM I2C: '%s' STATUS=0x%02x PRESENCE=0x%02x\n",
+		   name,
+		   readl(base + AE9_I2C_STATUS) & 0xff,
+		   readl(base + AE9_ACM_PRESENCE) & 0xff);
+
 }
 
 /*
- * ae9_acm_bus_init - TX #1 + TX #2 preamble: init CA0113 I2C controller
- * and release the ACM MCU from reset.
+ * ae9_acm_bus_init - TX #1: init CA0113 I2C controller, release ACM MCU.
  *
- * Exact replay of VFIO trace:
- *   Lines  68-114: TX #1  (reset + FIFO + GPIO pulse)
- *   Lines 63983-64000: TX #2 preamble (STATUS=0x83 write + CMD=0x0d)
+ * Sequence from ae9_init_unique_transactions.txt (TX #1, confirmed
+ * by cross-referencing raw VFIO trace ae9_mmio_capture.txt lines 68-90).
  *
- * Critical findings:
- *   - AE9_I2C_STATUS (0xc0c) is a COMMAND register — each state is
- *     written explicitly: 0x80 -> 0x00 -> 0x03.  Nothing auto-transitions.
- *   - STATUS=0x83 is WRITTEN by the driver ~6s after TX #1 GPIO pulse,
- *     NOT a hardware-generated event.
- *   - 0x320 is written to 0x0105 once before first packet TX.
+ * All STATUS/FIFO entries in the unique-transactions file are WRITES —
+ * this was confirmed from the raw trace where direction is explicit.
+ *
+ *   WRITE STATUS = 0x80   reset-hold
+ *   WRITE CMD    = 0x30   clock divider
+ *   WRITE DATA   = 0x00   kick
+ *   WRITE STATUS = 0x00   force transition
+ *   WRITE STATUS = 0x03   force bus-ready  (x3 confirms)
+ *   WRITE FIFO   = 0x01 \
+ *   WRITE FIFO   = 0xf1  | I2C peripheral config for ACM MCU
+ *   WRITE FIFO   = 0x01  |
+ *   WRITE FIFO   = 0xc7  |
+ *   WRITE FIFO   = 0xc1 /
+ *   WRITE DATA   = 0x80   commit FIFO, release MCU from reset
+ *   WRITE STATUS = 0x83   signal MCU up (IMMEDIATELY, no delay)
+ *   WRITE CMD    = 0x0d   finalize
+ *   WRITE DATA   = 0x00
+ *   WRITE STATUS = 0x03   revert to ready
+ *   WRITE CMD    = 0xf0 \
+ *   WRITE CMD    = 0x81  | TX#2: ACM reset packet (end of TX#1 in file)
+ *   WRITE CMD    = 0x00 /
  */
 static int ae9_acm_bus_init(struct hda_codec *d1)
 {
 	struct ca0132_spec *spec = d1->spec;
 	void __iomem *base = spec->mem_base;
-	unsigned int st, pres;
+	unsigned int st, presence;
 
-	/* --- TX #1 part A: I2C controller reset sequence --- */
-
-	/* Observe initial state (VFIO line 68-69) */
-	pres = readl(base + AE9_ACM_PRESENCE) & 0xff;
-	st   = readl(base + AE9_I2C_STATUS)   & 0xff;
+	/* Observe state before init */
+	presence = readl(base + AE9_ACM_PRESENCE) & 0xff;
+	st = readl(base + AE9_I2C_STATUS) & 0xff;
 	codec_info(d1,
 		   "AE-9: ACM presence (0xc7c) = 0x%02x, "
-		   "I2C STATUS at entry = 0x%02x\n", pres, st);
+		   "I2C STATUS at entry = 0x%02x\n", presence, st);
 
-	/* Step 1: reset-hold (VFIO line 70) */
-	writel(AE9_I2C_STATUS_IDLE, base + AE9_I2C_STATUS);
+	/* WRITE STATUS=0x80 — assert reset-hold */
+	writel(0x80, base + AE9_I2C_STATUS);
 	readl(base + AE9_I2C_STATUS);
 
-	/* Step 2: clock divider / bus enable (VFIO line 72) */
+	/* WRITE CMD=0x30 — clock divider / bus enable */
 	writel(0x30, base + AE9_I2C_CMD);
 	readl(base + AE9_I2C_CMD);
 
-	/* Step 3: data kick (VFIO line 74) */
+	/* WRITE DATA=0x00 — data kick */
 	writel(0x00, base + AE9_I2C_DATA);
 	readl(base + AE9_I2C_DATA);
 
 	st = readl(base + AE9_I2C_STATUS) & 0xff;
 	codec_info(d1, "AE-9: I2C STATUS after CMD+DATA = 0x%02x\n", st);
 
-	/* Step 4: force transition to 0x00 (VFIO line 77) */
+	/* WRITE STATUS=0x00 — force transition */
 	writel(0x00, base + AE9_I2C_STATUS);
 	readl(base + AE9_I2C_STATUS);
 
 	st = readl(base + AE9_I2C_STATUS) & 0xff;
 	codec_info(d1, "AE-9: I2C STATUS after force-0x00 = 0x%02x\n", st);
 
-	/* Step 5: force bus-ready + triple confirm (VFIO lines 79-90) */
+	/* WRITE STATUS=0x03 — force bus-ready (x3) */
 	readl(base + AE9_ACM_PRESENCE);
 	readl(base + AE9_I2C_STATUS);
-	writel(AE9_I2C_STATUS_READY, base + AE9_I2C_STATUS);
-	readl(base + AE9_I2C_STATUS);
-	readl(base + AE9_ACM_PRESENCE);
-	readl(base + AE9_I2C_STATUS);
-	writel(AE9_I2C_STATUS_READY, base + AE9_I2C_STATUS);
+	writel(0x03, base + AE9_I2C_STATUS);
 	readl(base + AE9_I2C_STATUS);
 	readl(base + AE9_ACM_PRESENCE);
 	readl(base + AE9_I2C_STATUS);
-	writel(AE9_I2C_STATUS_READY, base + AE9_I2C_STATUS);
+	writel(0x03, base + AE9_I2C_STATUS);
+	readl(base + AE9_I2C_STATUS);
+	readl(base + AE9_ACM_PRESENCE);
+	readl(base + AE9_I2C_STATUS);
+	writel(0x03, base + AE9_I2C_STATUS);
 	readl(base + AE9_I2C_STATUS);
 
 	st = readl(base + AE9_I2C_STATUS) & 0xff;
 	codec_info(d1, "AE-9: I2C STATUS before FIFO = 0x%02x\n", st);
 
-	/* --- TX #1 part B: load FIFO (VFIO lines 91-105) --- */
-
-	/*
-	 * Read FIFO once before loading; then write each byte with
-	 * double-read between writes (readback always returns 0xc1).
-	 */
+	/* Load FIFO — read between each write required */
 	readl(base + AE9_I2C_FIFO);
 	writel(0x01, base + AE9_I2C_FIFO);
-	readl(base + AE9_I2C_FIFO); readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
 	writel(0xf1, base + AE9_I2C_FIFO);
-	readl(base + AE9_I2C_FIFO); readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
 	writel(0x01, base + AE9_I2C_FIFO);
-	readl(base + AE9_I2C_FIFO); readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
 	writel(0xc7, base + AE9_I2C_FIFO);
-	readl(base + AE9_I2C_FIFO); readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
+	readl(base + AE9_I2C_FIFO);
 	writel(0xc1, base + AE9_I2C_FIFO);
 	readl(base + AE9_I2C_FIFO);
 
-	/* --- TX #1 part C: trigger MCU release + GPIO pulse --- */
-
-	/* DATA=0x80 commits FIFO and releases ACM MCU (VFIO line 107) */
+	/* Read DATA before trigger */
 	readl(base + AE9_I2C_DATA);
+
+	/* WRITE DATA=0x80 — commit FIFO, release ACM MCU from reset */
 	writel(0x80, base + AE9_I2C_DATA);
 	readl(base + AE9_I2C_DATA);
 
@@ -8942,63 +9342,50 @@ static int ae9_acm_bus_init(struct hda_codec *d1)
 	codec_info(d1, "AE-9: I2C STATUS after DATA=0x80 = 0x%02x\n", st);
 
 	/*
-	 * GPIO pulse on 0x1c: clear bit 23 then restore.
-	 * Immediately follows DATA=0x80 in VFIO trace (lines 109-113).
+	 * WRITE STATUS=0x83 IMMEDIATELY — no delay.
+	 * From ae9_init_unique_transactions.txt TX#1: this follows DATA=0x80
+	 * directly. The driver signals MCU-up state explicitly.
 	 */
-	readl(base + 0x1c);
-	writel(0x480,    base + 0x1c);
-	readl(base + 0x1c); readl(base + 0x1c);
-	writel(0x880480, base + 0x1c);
-	readl(base + 0x1c);
-
+	writel(0x83, base + AE9_I2C_STATUS);
 	st = readl(base + AE9_I2C_STATUS) & 0xff;
-	codec_info(d1, "AE-9: I2C STATUS after GPIO pulse = 0x%02x\n", st);
+	codec_info(d1, "AE-9: I2C STATUS after write 0x83 = 0x%02x\n", st);
 
-	/*
-	 * ACM MCU boots asynchronously.  The VFIO capture shows a 6.14s
-	 * gap between TX #1 GPIO pulse and the next I2C activity.
-	 * Sleep 7s to ensure the MCU is up before sending STATUS=0x83.
-	 */
-	codec_info(d1, "AE-9: waiting 7s for ACM MCU to boot...\n");
-	msleep(7000);
-
-	/* --- TX #2 preamble (VFIO lines 63983-64000) --- */
-
-	/*
-	 * STATUS=0x83 is written by the driver after the 6s gap.
-	 * The MCU does NOT set this bit — it remains 0x03 until the
-	 * driver writes it explicitly.
-	 */
-	readl(base + AE9_ACM_PRESENCE);
-	st = readl(base + AE9_I2C_STATUS) & 0xff;
-	codec_info(d1,
-		   "AE-9: I2C STATUS before 0x83 write = 0x%02x\n", st);
-
-	writel(AE9_I2C_STATUS_ACM_UP, base + AE9_I2C_STATUS);
-	readl(base + AE9_I2C_STATUS);
-
-	/* Reset command to MCU: CMD=0x0d, DATA=0x00 */
+	/* CMD=0x0d + DATA=0x00 — finalize controller */
 	writel(0x0d, base + AE9_I2C_CMD);
 	readl(base + AE9_I2C_CMD);
 	writel(0x00, base + AE9_I2C_DATA);
 	readl(base + AE9_I2C_DATA);
 
-	/* Confirm 0x83 then revert to 0x03 */
-	readl(base + AE9_I2C_STATUS);
-	writel(AE9_I2C_STATUS_READY, base + AE9_I2C_STATUS);
+	st = readl(base + AE9_I2C_STATUS) & 0xff;
+	codec_info(d1, "AE-9: I2C STATUS after CMD=0x0d = 0x%02x\n", st);
+
+	/* STATUS=0x03 — revert to bus-ready */
+	writel(0x03, base + AE9_I2C_STATUS);
 	readl(base + AE9_I2C_STATUS);
 
-	/* I2C GPIO control — written once before first packet */
-	writew(AE9_I2C_GPIO_INIT, base + AE9_I2C_GPIO_CTL);
+	/*
+	 * TX#1 tail: CMD=0xf0, CMD=0x81, CMD=0x00 — ACM MCU reset packet.
+	 * These three CMD writes are the last entries of TX#1 in
+	 * ae9_init_unique_transactions.txt. They signal the MCU to begin
+	 * firmware execution. TX#2 (handshake) follows immediately after.
+	 */
+	writel(0xf0, base + AE9_I2C_CMD);
+	readl(base + AE9_I2C_CMD);
+	writel(0x81, base + AE9_I2C_CMD);
+	readl(base + AE9_I2C_CMD);
+	writel(0x00, base + AE9_I2C_CMD);
+	readl(base + AE9_I2C_CMD);
+
+	/* TX#1 end-of-packet terminator (confirmed in raw VFIO trace) */
+	writel(0xf7, base + AE9_I2C_CMD);
+	readl(base + AE9_I2C_CMD);
 
 	st = readl(base + AE9_I2C_STATUS) & 0xff;
-	codec_info(d1,
-		   "AE-9: bus init complete, STATUS=0x%02x (expect 0x03)\n",
+	codec_info(d1, "AE-9: bus init complete, STATUS=0x%02x (expect 0x03)\n",
 		   st);
 
 	return 0;
 }
-
 /*
  * ae9_acm_init - full AE-9 ACM initialisation sequence (TX #2-#29).
  *
@@ -9022,78 +9409,82 @@ static int ae9_acm_init(struct hda_codec *d1, struct hda_codec *d2)
 	unsigned int st;
 	int err;
 
-	/* TX #2: reset */
-	static const u8 tx02[] = {0x81, 0x00};
-	/* TX #3: handshake forward */
-	static const u8 tx03[] = {0x54, 0x04, 0x41, 0x63, 0x6d, 0x31};
-	/* TX #4: handshake reverse */
-	static const u8 tx04[] = {0x54, 0x04, 0x31, 0x6d, 0x63, 0x41};
-	/* TX #5: config */
-	static const u8 tx05[] = {0xd5, 0x03, 0x00, 0x20, 0x04};
-	/* TX #6: status check */
-	static const u8 tx06[] = {0x54, 0x04, 0x11, 0x11, 0x11, 0x11};
-	/* TX #7: key */
-	static const u8 tx07[] = {
+	/*
+	 * Packet payloads — byte-for-byte from ae9_init_unique_transactions.txt.
+	 * TX#1 (bus init) is handled by ae9_acm_bus_init() above and ends with
+	 * f0 81 00 which is the reset packet. TX#2 starts the handshake.
+	 */
+
+	/* TX#2/TX#3: hs_fwd — 54 04 41 63 6d 31 */
+	static const u8 tx_hs_fwd[] = {0x54, 0x04, 0x41, 0x63, 0x6d, 0x31};
+	/* TX#3/TX#4-like: hs_rev — 54 04 31 6d 63 41 */
+	static const u8 tx_hs_rev[] = {0x54, 0x04, 0x31, 0x6d, 0x63, 0x41};
+	/* TX#4: cfg — d5 03 00 20 04 */
+	static const u8 tx_cfg[]    = {0xd5, 0x03, 0x00, 0x20, 0x04};
+	/* TX#5: stchk — 54 04 11 11 11 11 */
+	static const u8 tx_stchk[]  = {0x54, 0x04, 0x11, 0x11, 0x11, 0x11};
+	/* TX#6: key — 55 07 00 20 04 de c0 ad de */
+	static const u8 tx_key[]    = {
 		0x55, 0x07, 0x00, 0x20, 0x04,
 		0xde, 0xc0, 0xad, 0xde};
-	/* TX #8: GPIO config */
-	static const u8 tx08[] = {0x03, 0x03, 0x05, 0x03, 0x03};
-	/* TX #9: sample rate 48 kHz */
-	static const u8 tx09[] = {0x32, 0x03, 0x02, 0xb8, 0x0b};
-	/* TX #10: volume */
-	static const u8 tx10[] = {0x43, 0x04, 0x64, 0x00, 0xf4, 0x01};
-	/* TX #11: sample rate 96 kHz */
-	static const u8 tx11[] = {0x32, 0x03, 0x01, 0x88, 0x13};
-	/* TX #12: channel config */
-	static const u8 tx12[] = {0x05, 0x03, 0x02, 0x01, 0x00};
-	/* TX #13: unmute ch1 */
-	static const u8 tx13[] = {0x22, 0x02, 0x01, 0x00};
-	/* TX #14: mute ch2 */
-	static const u8 tx14[] = {0x22, 0x02, 0x02, 0x01};
-	/* TX #15: GPIO output */
-	static const u8 tx15[] = {0x03, 0x03, 0x02, 0x00, 0x40};
-	/* TX #16: device name "AE-9" (ASCII) */
-	static const u8 tx16[] = {
+	/* TX#7: gpio1 — 03 03 05 03 03 */
+	static const u8 tx_gpio1[]  = {0x03, 0x03, 0x05, 0x03, 0x03};
+	/* TX#8: sr48 — 32 03 02 b8 0b */
+	static const u8 tx_sr48[]   = {0x32, 0x03, 0x02, 0xb8, 0x0b};
+	/* TX#9: vol — 43 04 64 00 f4 01 */
+	static const u8 tx_vol[]    = {0x43, 0x04, 0x64, 0x00, 0xf4, 0x01};
+	/* TX#10: sr96 — 32 03 01 88 13 */
+	static const u8 tx_sr96[]   = {0x32, 0x03, 0x01, 0x88, 0x13};
+	/* TX#11: ch — 05 03 02 01 00 */
+	static const u8 tx_ch[]     = {0x05, 0x03, 0x02, 0x01, 0x00};
+	/* TX#12: unmute ch1 — 22 02 01 00 */
+	static const u8 tx_unmute[] = {0x22, 0x02, 0x01, 0x00};
+	/* TX#13: mute ch2 — 22 02 02 01 */
+	static const u8 tx_mute2[]  = {0x22, 0x02, 0x02, 0x01};
+	/* TX#14: gpio2 — 03 03 02 00 40 */
+	static const u8 tx_gpio2[]  = {0x03, 0x03, 0x02, 0x00, 0x40};
+	/* TX#15: name "AE-9" — 11 09 41 45 2d 39 00*5 */
+	static const u8 tx_name[]   = {
 		0x11, 0x09,
-		0x41, 0x45, 0x2d, 0x39,		/* "AE-9" */
+		0x41, 0x45, 0x2d, 0x39,	/* "AE-9" */
 		0x00, 0x00, 0x00, 0x00, 0x00};
-	/* TX #17: power config */
-	static const u8 tx17[] = {0x21, 0x03, 0x02, 0x00, 0x00};
-	/* TX #18: output 1 = DAC ch2 */
-	static const u8 tx18[] = {0x83, 0x01, 0x02};
-	/* TX #19: output 2 = DAC ch7 */
-	static const u8 tx19[] = {0x83, 0x01, 0x07};
-	/* TX #20: reset */
-	static const u8 tx20[] = {0x81, 0x00};
-	/* TX #21: query */
-	static const u8 tx21[] = {0xc2, 0x00};
-	/* TX #22: input select */
-	static const u8 tx22[] = {0x85, 0x01, 0x02};
-	/* TX #23: DAC ch1 */
-	static const u8 tx23[] = {0xb1, 0x01, 0x01};
-	/* TX #24: DAC ch2 */
-	static const u8 tx24[] = {0xb1, 0x01, 0x02};
-	/* TX #25: DAC ch3 */
-	static const u8 tx25[] = {0xb1, 0x01, 0x03};
-	/* TX #26: label "-HP-" */
-	static const u8 tx26[] = {
+	/* TX#16: pwr — 21 03 02 00 00 */
+	static const u8 tx_pwr[]    = {0x21, 0x03, 0x02, 0x00, 0x00};
+	/* TX#17: out1 DAC ch2 — 83 01 02 */
+	static const u8 tx_out1[]   = {0x83, 0x01, 0x02};
+	/* TX#18: out2 DAC ch7 — 83 01 07 */
+	static const u8 tx_out2[]   = {0x83, 0x01, 0x07};
+	/* TX#19: reset2 — 81 00 */
+	static const u8 tx_reset2[] = {0x81, 0x00};
+	/* TX#20: query — c2 00 */
+	static const u8 tx_query[]  = {0xc2, 0x00};
+	/* TX#21: insel — 85 01 02 */
+	static const u8 tx_insel[]  = {0x85, 0x01, 0x02};
+	/* TX#22: dac1 — b1 01 01 */
+	static const u8 tx_dac1[]   = {0xb1, 0x01, 0x01};
+	/* TX#23: dac2 — b1 01 02 */
+	static const u8 tx_dac2[]   = {0xb1, 0x01, 0x02};
+	/* TX#24: dac3 — b1 01 03 */
+	static const u8 tx_dac3[]   = {0xb1, 0x01, 0x03};
+	/* TX#25: label "-HP-" — 11 09 2d 48 50 2d 00*5 */
+	static const u8 tx_lbl_hp[] = {
 		0x11, 0x09,
-		0x2d, 0x48, 0x50, 0x2d,		/* "-HP-" */
+		0x2d, 0x48, 0x50, 0x2d,	/* "-HP-" */
 		0x00, 0x00, 0x00, 0x00, 0x00};
-	/* TX #27: label "-24.5" */
-	static const u8 tx27[] = {
+	/* TX#26: label "-24.5" — 11 09 2d 32 34 2e 35 00*4 */
+	static const u8 tx_lbl_245[] = {
 		0x11, 0x09,
 		0x2d, 0x32, 0x34, 0x2e, 0x35,	/* "-24.5" */
 		0x00, 0x00, 0x00, 0x00, 0x00};
-	/* TX #28: GPIO fine-tune */
-	static const u8 tx28[] = {0x03, 0x03, 0x02, 0x40, 0x40};
-	/* TX #29: label "-15.0" */
-	static const u8 tx29[] = {
+	/* TX#27: gpio3 — 03 03 02 40 40 */
+	static const u8 tx_gpio3[]  = {0x03, 0x03, 0x02, 0x40, 0x40};
+	/* TX#28: label "-15.0" — 11 09 2d 31 35 2e 30 00*4 */
+	static const u8 tx_lbl_150[] = {
 		0x11, 0x09,
 		0x2d, 0x31, 0x35, 0x2e, 0x30,	/* "-15.0" */
 		0x00, 0x00, 0x00, 0x00, 0x00};
-	/* TX #30: unmute ch1 (final) */
-	static const u8 tx30[] = {0x22, 0x02, 0x01, 0x01};
+	/* TX#29: unmute final — 22 02 01 01 */
+	static const u8 tx_unmute2[] = {0x22, 0x02, 0x01, 0x01};
 
 	/*
 	 * Log D2 firmware identity for diagnostics.
@@ -9115,17 +9506,23 @@ static int ae9_acm_init(struct hda_codec *d1, struct hda_codec *d2)
 	if (err < 0)
 		return err;
 
-	codec_info(d1, "AE-9 ACM: Phase 1 — reset + handshake\n");
-	ae9_i2c_send(d1, "reset",   tx02, ARRAY_SIZE(tx02));
-	usleep_range(2000, 5000);
-	ae9_i2c_send(d1, "hs_fwd",  tx03, ARRAY_SIZE(tx03));
-	ae9_i2c_send(d1, "hs_rev",  tx04, ARRAY_SIZE(tx04));
-	ae9_i2c_send(d1, "cfg",     tx05, ARRAY_SIZE(tx05));
-	ae9_i2c_send(d1, "stchk",   tx06, ARRAY_SIZE(tx06));
-	ae9_i2c_send(d1, "hs_fwd",  tx03, ARRAY_SIZE(tx03));
-	ae9_i2c_send(d1, "hs_rev",  tx04, ARRAY_SIZE(tx04));
-	ae9_i2c_send(d1, "key",     tx07, ARRAY_SIZE(tx07));
-	ae9_i2c_send(d1, "stchk",   tx06, ARRAY_SIZE(tx06));
+	/*
+	 * P01-P09: exact sequence from raw VFIO capture (ae9_analysis_report.txt).
+	 * Each packet is terminated with 0xf7 by ae9_i2c_send().
+	 * P01: reset (separate from the f0 81 00 at end of TX#1/bus_init)
+	 * P02-P05: first handshake round
+	 * P06-P09: second handshake round + key exchange
+	 */
+	/*
+	 * TX#2-TX#29: exact sequence from ae9_init_unique_transactions.txt.
+	 * TX#1 ends with f0 81 00 (reset), so TX#2 starts the handshake.
+	 */
+	codec_info(d1, "AE-9 ACM: Phase 1 — handshake + key\n");
+	ae9_i2c_send(d1, "hs_fwd",   tx_hs_fwd,  ARRAY_SIZE(tx_hs_fwd));  /* TX#2 */
+	ae9_i2c_send(d1, "hs_rev",   tx_hs_rev,  ARRAY_SIZE(tx_hs_rev));  /* TX#3 */
+	ae9_i2c_send(d1, "cfg",      tx_cfg,     ARRAY_SIZE(tx_cfg));     /* TX#4 */
+	ae9_i2c_send(d1, "stchk",    tx_stchk,   ARRAY_SIZE(tx_stchk));   /* TX#5 */
+	ae9_i2c_send(d1, "key",      tx_key,     ARRAY_SIZE(tx_key));     /* TX#6 */
 	usleep_range(5000, 10000);
 
 	/* Read STATUS via D2 verb after handshake (diagnostic only) */
@@ -9142,36 +9539,32 @@ static int ae9_acm_init(struct hda_codec *d1, struct hda_codec *d2)
 	}
 
 	codec_info(d1, "AE-9 ACM: Phase 2 — audio config\n");
-	ae9_i2c_send(d1, "gpio1",   tx08, ARRAY_SIZE(tx08));
-	ae9_i2c_send(d1, "sr48",    tx09, ARRAY_SIZE(tx09));
-	ae9_i2c_send(d1, "vol",     tx10, ARRAY_SIZE(tx10));
-	ae9_i2c_send(d1, "sr96",    tx11, ARRAY_SIZE(tx11));
-	ae9_i2c_send(d1, "ch",      tx12, ARRAY_SIZE(tx12));
-	ae9_i2c_send(d1, "unmute",  tx13, ARRAY_SIZE(tx13));
-	ae9_i2c_send(d1, "mute2",   tx14, ARRAY_SIZE(tx14));
-	ae9_i2c_send(d1, "gpio2",   tx15, ARRAY_SIZE(tx15));
+	ae9_i2c_send(d1, "gpio1",    tx_gpio1,   ARRAY_SIZE(tx_gpio1));   /* TX#7 */
+	ae9_i2c_send(d1, "sr48",     tx_sr48,    ARRAY_SIZE(tx_sr48));    /* TX#8 */
+	ae9_i2c_send(d1, "vol",      tx_vol,     ARRAY_SIZE(tx_vol));     /* TX#9 */
+	ae9_i2c_send(d1, "sr96",     tx_sr96,    ARRAY_SIZE(tx_sr96));    /* TX#10 */
+	ae9_i2c_send(d1, "ch",       tx_ch,      ARRAY_SIZE(tx_ch));      /* TX#11 */
+	ae9_i2c_send(d1, "unmute",   tx_unmute,  ARRAY_SIZE(tx_unmute));  /* TX#12 */
+	ae9_i2c_send(d1, "mute2",    tx_mute2,   ARRAY_SIZE(tx_mute2));   /* TX#13 */
+	ae9_i2c_send(d1, "gpio2",    tx_gpio2,   ARRAY_SIZE(tx_gpio2));   /* TX#14 */
 
 	codec_info(d1, "AE-9 ACM: Phase 3 — DAC routing\n");
-	ae9_i2c_send(d1, "name",    tx16, ARRAY_SIZE(tx16));
-	ae9_i2c_send(d1, "pwr",     tx17, ARRAY_SIZE(tx17));
-	ae9_i2c_send(d1, "out1",    tx18, ARRAY_SIZE(tx18));
-	ae9_i2c_send(d1, "out2",    tx19, ARRAY_SIZE(tx19));
-	ae9_i2c_send(d1, "reset2",  tx20, ARRAY_SIZE(tx20));
+	ae9_i2c_send(d1, "name",     tx_name,    ARRAY_SIZE(tx_name));    /* TX#15 */
+	ae9_i2c_send(d1, "pwr",      tx_pwr,     ARRAY_SIZE(tx_pwr));     /* TX#16 */
+	ae9_i2c_send(d1, "out1",     tx_out1,    ARRAY_SIZE(tx_out1));    /* TX#17 */
+	ae9_i2c_send(d1, "out2",     tx_out2,    ARRAY_SIZE(tx_out2));    /* TX#18 */
+	ae9_i2c_send(d1, "reset2",   tx_reset2,  ARRAY_SIZE(tx_reset2));  /* TX#19 */
 	usleep_range(2000, 5000);
-	ae9_i2c_send(d1, "hs_fwd",  tx03, ARRAY_SIZE(tx03));
-	ae9_i2c_send(d1, "hs_rev",  tx04, ARRAY_SIZE(tx04));
-	ae9_i2c_send(d1, "cfg",     tx05, ARRAY_SIZE(tx05));
-	ae9_i2c_send(d1, "stchk",   tx06, ARRAY_SIZE(tx06));
-	ae9_i2c_send(d1, "query",   tx21, ARRAY_SIZE(tx21));
-	ae9_i2c_send(d1, "insel",   tx22, ARRAY_SIZE(tx22));
-	ae9_i2c_send(d1, "dac1",    tx23, ARRAY_SIZE(tx23));
-	ae9_i2c_send(d1, "dac2",    tx24, ARRAY_SIZE(tx24));
-	ae9_i2c_send(d1, "dac3",    tx25, ARRAY_SIZE(tx25));
-	ae9_i2c_send(d1, "label_hp", tx26, ARRAY_SIZE(tx26));
-	ae9_i2c_send(d1, "label_24", tx27, ARRAY_SIZE(tx27));
-	ae9_i2c_send(d1, "gpio3",   tx28, ARRAY_SIZE(tx28));
-	ae9_i2c_send(d1, "label_15", tx29, ARRAY_SIZE(tx29));
-	ae9_i2c_send(d1, "unmute2", tx30, ARRAY_SIZE(tx30));
+	ae9_i2c_send(d1, "query",    tx_query,   ARRAY_SIZE(tx_query));   /* TX#20 */
+	ae9_i2c_send(d1, "insel",    tx_insel,   ARRAY_SIZE(tx_insel));   /* TX#21 */
+	ae9_i2c_send(d1, "dac1",     tx_dac1,    ARRAY_SIZE(tx_dac1));    /* TX#22 */
+	ae9_i2c_send(d1, "dac2",     tx_dac2,    ARRAY_SIZE(tx_dac2));    /* TX#23 */
+	ae9_i2c_send(d1, "dac3",     tx_dac3,    ARRAY_SIZE(tx_dac3));    /* TX#24 */
+	ae9_i2c_send(d1, "lbl_hp",   tx_lbl_hp,  ARRAY_SIZE(tx_lbl_hp)); /* TX#25 */
+	ae9_i2c_send(d1, "lbl_245",  tx_lbl_245, ARRAY_SIZE(tx_lbl_245));/* TX#26 */
+	ae9_i2c_send(d1, "gpio3",    tx_gpio3,   ARRAY_SIZE(tx_gpio3));   /* TX#27 */
+	ae9_i2c_send(d1, "lbl_150",  tx_lbl_150, ARRAY_SIZE(tx_lbl_150));/* TX#28 */
+	ae9_i2c_send(d1, "unmute2",  tx_unmute2, ARRAY_SIZE(tx_unmute2)); /* TX#29 */
 
 	/* Final status check */
 	st = readl(base + AE9_I2C_STATUS) & 0xff;
@@ -9326,6 +9719,66 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 
 	ae9_post_dsp_asi_setup(codec);
 
+	/*
+	 * AE-9: start stream 0x05 (HDA→DSP) AFTER ae9_post_dsp_stream_setup()
+	 * has configured its source (0x43) and dest (0x00). Starting it earlier
+	 * in ca0132_alt_start_dsp_audio_streams() would lock in the 8051 default
+	 * ports (src=0x3b, dst=0x4d).
+	 */
+	mutex_lock(&spec->chipio_mutex);
+	chipio_set_stream_control(codec, 0x05, 1);
+	mutex_unlock(&spec->chipio_mutex);
+	codec_info(codec, "AE-9: stream 0x05 started after source/dest setup\n");
+
+	/* AE-9 DEBUG: verify stream pipeline is active after ASI setup */
+	{
+		unsigned int ctrl_05 = 0, ctrl_0c = 0, ctrl_18 = 0;
+
+		mutex_lock(&spec->chipio_mutex);
+		chipio_get_stream_control(codec, 0x05, &ctrl_05);
+		chipio_get_stream_control(codec, 0x0c, &ctrl_0c);
+		chipio_get_stream_control(codec, 0x18, &ctrl_18);
+		mutex_unlock(&spec->chipio_mutex);
+		codec_info(codec,
+			   "AE-9: stream states: 0x05=%u 0x0c=%u 0x18=%u "
+			   "(expect 0,1,1)\n",
+			   ctrl_05, ctrl_0c, ctrl_18);
+	}
+
+	/*
+	 * Wait for the 8051 to register stream 0x0c in exram (table at
+	 * 0x1578). chipio_set_stream_control() inside ae9_post_dsp_asi_setup()
+	 * only tells the DSP to start — the 8051 writes the exram offset
+	 * asynchronously. 200ms is sufficient in practice.
+	 */
+	msleep(200);
+	ae9_post_dsp_setup_ports(codec);
+
+	/*
+	 * AE-9 DEBUG: dump audio router at the correct offset for stream 0x0c.
+	 * exram offset=0x0c → base address = 0x190000 + (0x0c * 4) = 0x190030.
+	 * Reading 0x190000 would show unrelated entries (stream 0x00).
+	 * stream_remap_data[1] writes 12 entries starting at this offset.
+	 */
+	{
+		unsigned int ae9_rt_val;
+		unsigned int ae9_rt_base;
+		int ae9_rt_j;
+
+		/* base = 0x190000 + exram_offset_of_stream_0x0c * 4 */
+		ae9_rt_base = 0x190000 + (0x0c * 4);
+
+		for (ae9_rt_j = 0; ae9_rt_j < 12; ae9_rt_j++) {
+			chipio_read(codec,
+				    ae9_rt_base + (ae9_rt_j * 4),
+				    &ae9_rt_val);
+			codec_info(codec,
+				   "AE-9: audio_router[0x%04x]=0x%08x\n",
+				   ae9_rt_base + (ae9_rt_j * 4),
+				   ae9_rt_val);
+		}
+	}
+
 	/* out, in effects + voicefx */
 	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
 	for (idx = 0; idx < num_fx; idx++) {
@@ -9370,6 +9823,14 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		codec_info(codec,
 			"AE-9: GPIO 4+5 set, ACM already initialised\n");
 	}
+
+	/*
+	 * Program DSP output routing (dac2port + MMIO presets) now that
+	 * the DSP is fully up. ca0132_init() calls this before ae9_setup_defaults()
+	 * so the DSP resets it — we must re-apply here.
+	 */
+	codec_info(codec, "AE-9: calling alt_select_out after DSP setup\n");
+	ca0132_alt_select_out(codec);
 }
 
 /*
@@ -10438,6 +10899,20 @@ static void ca0132_alt_init(struct hda_codec *codec)
 		ca0113_mmio_command_set(codec, 0x30, 0x32, 0x3f);
 		break;
 	case QUIRK_AE9:
+		/*
+		 * AE-9 init differs from AE-7: 0x18b030=0x27 (not 0x20),
+		 * and gpio_set(3, false) instead of mmio_command_set.
+		 * Source: patch 0006 (Connor McAdams).
+		 */
+		ca0132_gpio_init(codec);
+		chipio_8051_write_pll_pmu(codec, 0x49, 0x88);
+		snd_hda_sequence_write(codec, spec->chip_init_verbs);
+		snd_hda_sequence_write(codec, spec->desktop_init_verbs);
+		chipio_write(codec, 0x18b008, 0x000000f8);
+		chipio_write(codec, 0x18b008, 0x000000f0);
+		chipio_write(codec, 0x18b030, 0x00000027);
+		ca0113_mmio_gpio_set(codec, 3, false);
+		break;
 	case QUIRK_AE7:
 		ca0132_gpio_init(codec);
 		chipio_8051_write_pll_pmu(codec, 0x49, 0x88);
@@ -10632,6 +11107,7 @@ static void ca0132_free(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	cancel_delayed_work_sync(&spec->ae9_acm_work);
+	cancel_delayed_work_sync(&spec->ae9_hb_work);
 	snd_hda_power_up(codec);
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
@@ -10839,6 +11315,48 @@ static void ca0132_config(struct hda_codec *codec)
 		break;
 	case QUIRK_AE5:
 	case QUIRK_AE9:
+		/*
+		 * AE-9 pin layout differs from AE-7:
+		 *   0x0f = BackPanel HP Out (ACM board headphone jack, tag=07)
+		 *   0x10 = Front HP / Center-LFE (tag=04)
+		 *   0x11 = LineMicIn2 / Rear L/R (input, not HP)
+		 * unsol_tag_hp must point to 0x0f so jack detect and
+		 * ca0132_alt_select_out() route audio to the correct pin.
+		 */
+		/*
+		 * AE-9: NID 0x02 reports no supported rates (param 0x06=0x0)
+		 * because the CA0132 DSP handles all sample-rate conversion.
+		 * Without AC_WCAP_FORMAT_OVRD the HDA core ignores the rates
+		 * declared in ca0132_build_pcms() and falls back to querying
+		 * the hardware, getting 0x0 and picking DIV=2 (24kHz), which
+		 * causes fmt=0x0011 and a stalled DMA ring buffer.
+		 */
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			snd_hda_override_wcaps(codec, 0x02,
+				get_wcaps(codec, 0x02) | AC_WCAP_FORMAT_OVRD);
+		spec->num_outputs = 2;
+		spec->out_pins[0] = 0x0B; /* Line out */
+		spec->out_pins[1] = 0x0F; /* BackPanel HP Out (ACM headphone) */
+		spec->out_pins[2] = 0x10; /* Front Headphone / Center/LFE */
+		spec->out_pins[3] = 0x11; /* Rear surround / LineMicIn2 */
+		spec->shared_out_nid = 0x2;
+		spec->unsol_tag_hp = spec->out_pins[1];       /* 0x0f */
+		spec->unsol_tag_front_hp = spec->out_pins[2]; /* 0x10 */
+
+		spec->adcs[0] = 0x7; /* Rear Mic / Line-in */
+		spec->adcs[1] = 0x8; /* Front Mic, but only if no DSP */
+		spec->adcs[2] = 0xa; /* what u hear */
+
+		spec->num_inputs = 2;
+		spec->input_pins[0] = 0x12; /* Rear Mic / Line-in */
+		spec->input_pins[1] = 0x13; /* What U Hear */
+		spec->shared_mic_nid = 0x7;
+		spec->unsol_tag_amic1 = spec->input_pins[0];
+
+		/* SPDIF I/O */
+		spec->dig_out = 0x05;
+		spec->multiout.dig_out_nid = spec->dig_out;
+		break;
 	case QUIRK_AE7:
 		spec->num_outputs = 2;
 		spec->out_pins[0] = 0x0B; /* Line out */
@@ -11112,6 +11630,7 @@ static int ca0132_codec_probe(struct hda_codec *codec, const struct hda_device_i
 
 	INIT_DELAYED_WORK(&spec->unsol_hp_work, ca0132_unsol_hp_delayed);
 	INIT_DELAYED_WORK(&spec->ae9_acm_work, ca0132_ae9_acm_delayed);
+	INIT_DELAYED_WORK(&spec->ae9_hb_work, ca0132_ae9_hb_work);
 
 	ca0132_init_chip(codec);
 
