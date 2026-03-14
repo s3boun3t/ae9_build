@@ -1,0 +1,380 @@
+Stream 0x00:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x01:
+    SourceConnID:  0x82
+    Channels:      0x02
+    DestConnID:    0x56
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x02:
+    SourceConnID:  0x82
+    Channels:      0x02
+    DestConnID:    0x06
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x03:
+    SourceConnID:  0x64
+    Channels:      0x02
+    DestConnID:    0x03
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x04:
+    SourceConnID:  0x63
+    Channels:      0x02
+    DestConnID:    0x05
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x05:
+    SourceConnID:  0x43
+    Channels:      0x02
+    DestConnID:    0x00
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x06:
+    SourceConnID:  0x08
+    Channels:      0x02
+    DestConnID:    0x01
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x07:
+    SourceConnID:  0x41
+    Channels:      0x02
+    DestConnID:    0x02
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x08:
+    SourceConnID:  0x41
+    Channels:      0x02
+    DestConnID:    0x91
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x09:
+    SourceConnID:  0x45
+    Channels:      0x02
+    DestConnID:    0x90
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x0a:
+    SourceConnID:  0x0b
+    Channels:      0x02
+    DestConnID:    0x90
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x0b:
+    SourceConnID:  0x0a
+    Channels:      0x02
+    DestConnID:    0x57
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x0c:
+    SourceConnID:  0x09
+    Channels:      0x02
+    DestConnID:    0x70
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x0d:
+    SourceConnID:  0x09
+    Channels:      0x02
+    DestConnID:    0x07
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x0e:
+    SourceConnID:  0x0f
+    Channels:      0x02
+    DestConnID:    0x06
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x0f:
+    SourceConnID:  0x0c
+    Channels:      0x02
+    DestConnID:    0x54
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x10:
+    SourceConnID:  0x0e
+    Channels:      0x02
+    DestConnID:    0x52
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x11:
+    SourceConnID:  0x40
+    Channels:      0x02
+    DestConnID:    0x10
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x12:
+    SourceConnID:  0xc4
+    Channels:      0x02
+    DestConnID:    0x52
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x13:
+    SourceConnID:  0x64
+    Channels:      0x02
+    DestConnID:    0x54
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x14:
+    SourceConnID:  0x48
+    Channels:      0x02
+    DestConnID:    0x70
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x15:
+    SourceConnID:  0x49
+    Channels:      0x02
+    DestConnID:    0x71
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x16:
+    SourceConnID:  0x4a
+    Channels:      0x02
+    DestConnID:    0x72
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x17:
+    SourceConnID:  0xc6
+    Channels:      0x02
+    DestConnID:    0x03
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x18:
+    SourceConnID:  0x09
+    Channels:      0x02
+    DestConnID:    0xd1
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x19:
+    SourceConnID:  0xc4
+    Channels:      0x02
+    DestConnID:    0x00
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x1a:
+    SourceConnID:  0xc5
+    Channels:      0x02
+    DestConnID:    0x52
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x1b:
+    SourceConnID:  0x64
+    Channels:      0x02
+    DestConnID:    0xd0
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x1c:
+    SourceConnID:  0xc5
+    Channels:      0x02
+    DestConnID:    0xd0
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x1d:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x1e:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x1f:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x20:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x21:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x22:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x23:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x24:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
+Stream 0x25:
+    SourceConnID:  0xc8
+    Channels:      0x00
+    DestConnID:    0xc8
+    Type:          0x00
+    HDA Node:      0x00
+    Active:        0x00
+    HDA StreamID:  0x00
+    HDA StreamFmt: 0x0000
+
