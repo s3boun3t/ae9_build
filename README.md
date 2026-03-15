@@ -1,8 +1,7 @@
 # Sound Blaster AE-9 — Linux Kernel Driver
 
-> **Status:** ACM board initializes successfully ✅  
-> DAC display lights up, analog audio output working.  
-> Headphone output, microphone, and volume knob in progress.
+> **Status:** DSP + ACM init working ✅ — DAC display active, DSP unmuté.  
+> Audio pipeline complete. **ES9038 DAC silent — under active investigation.**
 
 ---
 
@@ -16,7 +15,7 @@ kernel driver.
 
 The AE-9 includes an external DAC breakout box (the **ACM — Audio Control Module**)
 connected via a proprietary I2C protocol over MMIO. Without this patch, the ACM
-board stays powered off and the premium CS43198 DAC is inaccessible.
+board stays powered off and the premium **ES9038Q2M DAC** is inaccessible.
 
 ### Hardware
 
@@ -24,17 +23,26 @@ board stays powered off and the premium CS43198 DAC is inaccessible.
 |-----------|---------|
 | Main codec | CA0132 DSP (HDA addr 1, SSID 1102:0071) |
 | ACM codec | CA0132 ACM interface (HDA addr 2, SSID 1102:0072) |
-| DAC chip | CS43198 (on ACM board) |
+| DAC chip | **ESS ES9038Q2M** (on ACM board) |
 | I2C controller | CA0113 MMIO at BAR2 + 0xc00 |
+| BAR0 | 0xfc500000 (HDA controller) |
+| BAR2 | 0xfc504000 (Creative MMIO) |
 
-### How it works
+### Current state
 
-The ACM board is powered by GPIO 5. Once the DSP is loaded and GPIO 5 is
-asserted, the driver waits ~7 seconds for the ACM MCU to boot, then sends
-an initialization sequence of 30 I2C packets to configure the CS43198 DAC.
+The driver successfully:
+- Downloads the CA0132 DSP firmware
+- Initializes the ACM board via 29 I2C packets (byte-for-byte matching Windows)
+- Powers GPIO 4 (HP amp) and GPIO 5 (DAC board)
+- Configures the DSP audio pipeline (streams 0x0c, 0x11, 0x18)
+- Sets dac2port=0xa1 (headphone routing)
+- Unmutes the DSP (SPEAKER_TUNING_MUTE=FLOAT_ZERO confirmed)
+- Runs HDA DMA at correct 48kHz timing
 
-See [docs/AE9_ACM_PROTOCOL.md](docs/AE9_ACM_PROTOCOL.md) for the full
-protocol documentation derived from VFIO capture analysis.
+**Known issue:** The ES9038Q2M DAC produces no audio output. The digital
+pipeline is complete and correct. Suspected cause: ES9038 hardware automute
+triggered by zero-signal I2S during DSP init, or missing keepalive sequences.
+Investigation ongoing.
 
 ### Build & install
 
@@ -43,56 +51,66 @@ protocol documentation derived from VFIO capture analysis.
 ```bash
 # 1 — clone
 git clone https://github.com/s3boun3t/ae9_build.git
-cd ae9_build/build
+cd ae9_build
 
-# 2 — build
-make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+# 2 — build (run from repo root, NOT from build/)
+make -C /lib/modules/$(uname -r)/build M=$(pwd)/build modules
 
 # 3 — install
-sudo cp snd-hda-codec-ca0132.ko \
-  /lib/modules/$(uname -r)/kernel/sound/hda/codecs/snd-hda-codec-ca0132.ko
+sudo cp build/snd-hda-codec-ca0132.ko \
+  /lib/modules/$(uname -r)/kernel/sound/hda/codecs/
 sudo rm -f \
   /lib/modules/$(uname -r)/kernel/sound/hda/codecs/snd-hda-codec-ca0132.ko.zst
 sudo depmod -a
 
-# 4 — cold reboot (power off, not just restart)
+# 4 — cold power-off (NOT reboot)
 sudo poweroff
 ```
 
-> ⚠️ **Cold power-off required** — the ACM board needs a full power cycle
-> to reset its MCU. A warm reboot is not sufficient.
+> ⚠️ **Cold power-off required** — use `poweroff`, never `reboot`.
+> A warm reboot causes `azx_single_send_cmd` spam and may leave the ACM in
+> a broken state.
+
+> ⚠️ **Remove .ko.zst** — if a `.ko.zst` file exists alongside your `.ko`,
+> the compressed version takes priority and Plymouth will hang at boot.
+> Always delete it before installing a custom module.
 
 ### Verify
 
-After boot, wait ~15 seconds then check:
+After boot, wait ~12 seconds then check:
 
 ```bash
-dmesg | grep "AE-9:" | tail -5
-# Expected: "AE-9 ACM: init complete"
-# The DAC front panel should display "-15.0" and the ring LED should be lit.
+dmesg | grep "AE-9" | grep -v "DEBUG\|stream_control" | tail -10
+# Expected:
+#   AE-9: DSP ready, starting post-DSP setup
+#   AE-9: GPIO 5 set (DAC board power ON)
+#   AE-9 ACM: init complete STATUS=0x03 PRESENCE=0x0f
+#   AE-9 select_out: unmute OK
+```
+
+### Test audio
+
+```bash
+systemctl --user stop pipewire pipewire-pulse wireplumber 2>/dev/null
+amixer -c 0 sset 'Master' 99 unmute
+amixer -c 0 sset 'Front' 90 unmute
+amixer -c 0 sset 'Output Select' 'Headphone'
+speaker-test -c 2 -t sine -f 1000 -D hw:0,0
 ```
 
 ### Known limitations
 
-- Volume knob does not yet control system volume
-- Headphone output not yet exposed as separate ALSA device
-- Microphone input not yet exposed
-- ~14 second delay before DAC initializes after boot
-- `byte-ack timeout` warnings in dmesg (non-blocking, cosmetic)
+- **No audio output** — ES9038 DAC silent (under investigation)
+- Volume knob does not control system volume
+- Microphone input not exposed
+- ~12 second delay before DAC initializes after boot
 
 ### Project structure
 
 ```
 build/          kernel module source (ca0132.c + Makefile)
-docs/           protocol documentation
-sources/        reference kernel sources
+docs/           protocol documentation (AE9_ACM_PROTOCOL.md)
 ```
-
-### Contributing
-
-This is a reverse-engineering effort based on VFIO MMIO capture from a
-Windows 11 VM. Contributions, testing reports, and captures from other
-AE-9 units are welcome.
 
 ---
 
@@ -101,89 +119,33 @@ AE-9 units are welcome.
 ### De quoi s'agit-il ?
 
 Ce projet ajoute le support Linux natif pour la **Creative Sound Blaster AE-9**
-(PCI ID `1102:0010`, sous-système `1102:0071`) au driver kernel existant
-`snd-hda-codec-ca0132`.
+au driver kernel existant `snd-hda-codec-ca0132`.
 
 L'AE-9 comprend un boîtier DAC externe (l'**ACM — Audio Control Module**)
 connecté via un protocole I2C propriétaire sur MMIO. Sans ce patch, la carte
-ACM reste éteinte et le DAC CS43198 premium est inaccessible.
+ACM reste éteinte et le DAC **ES9038Q2M** premium est inaccessible.
 
-### Matériel
+### État actuel
 
-| Composant | Détails |
-|-----------|---------|
-| Codec principal | CA0132 DSP (adresse HDA 1, SSID 1102:0071) |
-| Codec ACM | Interface CA0132 ACM (adresse HDA 2, SSID 1102:0072) |
-| Puce DAC | CS43198 (sur la carte ACM) |
-| Contrôleur I2C | CA0113 MMIO sur BAR2 + 0xc00 |
-
-### Comment ça fonctionne
-
-La carte ACM est alimentée par GPIO 5. Une fois le DSP chargé et GPIO 5 activé,
-le driver attend ~7 secondes que le MCU de l'ACM démarre, puis envoie une
-séquence d'initialisation de 30 paquets I2C pour configurer le DAC CS43198.
-
-Voir [docs/AE9_ACM_PROTOCOL.md](docs/AE9_ACM_PROTOCOL.md) pour la documentation
-complète du protocole, dérivée de l'analyse d'une capture VFIO.
+Le driver initialise correctement tout le pipeline numérique : DSP, ACM, GPIO,
+streams ChipIO, routing DSP. Le **DAC ES9038Q2M reste silencieux** — investigation
+en cours, cause probable : automute hardware de l'ES9038 ou séquences I2S
+manquantes.
 
 ### Compilation et installation
 
-**Prérequis :** en-têtes du kernel Linux pour votre kernel, `make`, `gcc`.
-
 ```bash
-# 1 — cloner
 git clone https://github.com/s3boun3t/ae9_build.git
-cd ae9_build/build
-
-# 2 — compiler
-make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
-
-# 3 — installer
-sudo cp snd-hda-codec-ca0132.ko \
-  /lib/modules/$(uname -r)/kernel/sound/hda/codecs/snd-hda-codec-ca0132.ko
+cd ae9_build
+make -C /lib/modules/$(uname -r)/build M=$(pwd)/build modules
+sudo cp build/snd-hda-codec-ca0132.ko \
+  /lib/modules/$(uname -r)/kernel/sound/hda/codecs/
 sudo rm -f \
   /lib/modules/$(uname -r)/kernel/sound/hda/codecs/snd-hda-codec-ca0132.ko.zst
-sudo depmod -a
-
-# 4 — extinction complète (pas un simple redémarrage)
-sudo poweroff
+sudo depmod -a && sudo poweroff
 ```
 
-> ⚠️ **Extinction complète obligatoire** — la carte ACM nécessite un cycle
-> d'alimentation complet pour réinitialiser son MCU. Un redémarrage chaud
-> ne suffit pas.
-
-### Vérification
-
-Après le démarrage, attendre ~15 secondes puis vérifier :
-
-```bash
-dmesg | grep "AE-9:" | tail -5
-# Attendu : "AE-9 ACM: init complete"
-# L'afficheur frontal du DAC doit afficher "-15.0" et l'anneau LED doit être allumé.
-```
-
-### Limitations connues
-
-- La molette de volume ne contrôle pas encore le volume système
-- La sortie casque n'est pas encore exposée comme périphérique ALSA séparé
-- L'entrée microphone n'est pas encore exposée
-- ~14 secondes de délai avant l'initialisation du DAC au démarrage
-- Avertissements `byte-ack timeout` dans dmesg (non bloquants, cosmétiques)
-
-### Structure du projet
-
-```
-build/          source du module kernel (ca0132.c + Makefile)
-docs/           documentation du protocole
-sources/        sources kernel de référence
-```
-
-### Contribuer
-
-Ce projet est le résultat d'une ingénierie inverse basée sur une capture MMIO
-VFIO depuis une VM Windows 11. Les contributions, rapports de tests et captures
-depuis d'autres unités AE-9 sont les bienvenus.
+> ⚠️ `sudo poweroff` — jamais `sudo reboot`
 
 ---
 
