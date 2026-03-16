@@ -1,0 +1,251 @@
+  Bus  0, device   0, function 0:
+    Host bridge: PCI device 8086:29c0
+      PCI subsystem 1af4:1100
+      id ""
+  Bus  0, device   1, function 0:
+    VGA controller: PCI device 1b36:0100
+      PCI subsystem 1af4:1100
+      IRQ 10, pin A
+      BAR0: 32 bit memory at 0x84000000 [0x87ffffff].
+      BAR1: 32 bit memory at 0x80000000 [0x83ffffff].
+      BAR2: 32 bit memory at 0x89f84000 [0x89f85fff].
+      BAR3: I/O at 0x7060 [0x707f].
+      BAR6: 32 bit memory at 0xffffffffffffffff [0x0000fffe].
+      id "video0"
+  Bus  0, device   2, function 0:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 1.
+      subordinate bus 2.
+      IO range [0xf000, 0x0fff]
+      memory range [0x89c00000, 0x89efffff]
+      prefetchable memory range [0x380000000000, 0x3807ffffffff]
+      BAR0: 32 bit memory at 0x89f95000 [0x89f95fff].
+      id "pci.1"
+  Bus  1, device   0, function 0:
+    PCI bridge: PCI device 1b36:000e
+      IRQ 11, pin A
+      BUS 1.
+      secondary bus 2.
+      subordinate bus 2.
+      IO range [0xf000, 0x0fff]
+      memory range [0x89c00000, 0x89dfffff]
+      prefetchable memory range [0x380000000000, 0x3807ffffffff]
+      BAR0: 64 bit memory at 0x89e00000 [0x89e000ff].
+      id "pci.16"
+  Bus  2, device   1, function 0:
+    Audio controller: PCI device 1102:0010
+      PCI subsystem 1102:0071
+      IRQ 23, pin A
+      BAR0: 64 bit memory at 0x89c00000 [0x89c03fff].
+      BAR2: 64 bit memory at 0x89c04000 [0x89c07fff].
+      id "hostdev0"
+  Bus  0, device   2, function 1:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 3.
+      subordinate bus 3.
+      IO range [0x6000, 0x6fff]
+      memory range [0x89a00000, 0x89bfffff]
+      prefetchable memory range [0x380800000000, 0x380fffffffff]
+      BAR0: 32 bit memory at 0x89f94000 [0x89f94fff].
+      id "pci.2"
+  Bus  3, device   0, function 0:
+    Ethernet controller: PCI device 8086:10d3
+      PCI subsystem 8086:0000
+      IRQ 0, pin A
+      BAR0: 32 bit memory at 0x89a20000 [0x89a3ffff].
+      BAR1: 32 bit memory at 0x89a00000 [0x89a1ffff].
+      BAR2: I/O at 0xffffffffffffffff [0x001e].
+      BAR3: 32 bit memory at 0x89a40000 [0x89a43fff].
+      BAR6: 32 bit memory at 0xffffffffffffffff [0x0007fffe].
+      id "net0"
+  Bus  0, device   2, function 2:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 4.
+      subordinate bus 4.
+      IO range [0xf000, 0x0fff]
+      memory range [0x89800000, 0x899fffff]
+      prefetchable memory range [0x381000000000, 0x3817ffffffff]
+      BAR0: 32 bit memory at 0x89f93000 [0x89f93fff].
+      id "pci.3"
+  Bus  4, device   0, function 0:
+    USB controller: PCI device 1b36:000d
+      PCI subsystem 1af4:1100
+      IRQ 0, pin A
+      BAR0: 64 bit memory at 0x89800000 [0x89803fff].
+      id "usb"
+  Bus  0, device   2, function 3:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 5.
+      subordinate bus 5.
+      IO range [0xf000, 0x0fff]
+      memory range [0x89600000, 0x897fffff]
+      prefetchable memory range [0x381800000000, 0x381fffffffff]
+      BAR0: 32 bit memory at 0x89f92000 [0x89f92fff].
+      id "pci.4"
+  Bus  5, device   0, function 0:
+    Class 1920: PCI device 1af4:1043
+      PCI subsystem 1af4:1100
+      IRQ 11, pin A
+      BAR1: 32 bit memory at 0x89600000 [0x89600fff].
+      BAR4: 64 bit prefetchable memory at 0x381800000000 [0x381800003fff].
+      id "virtio-serial0"
+  Bus  0, device   2, function 4:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 6.
+      subordinate bus 6.
+      IO range [0xf000, 0x0fff]
+      memory range [0x89400000, 0x895fffff]
+      prefetchable memory range [0x382000000000, 0x3827ffffffff]
+      BAR0: 32 bit memory at 0x89f91000 [0x89f91fff].
+      id "pci.5"
+  Bus  6, device   0, function 0:
+    Class 0255: PCI device 1af4:1045
+      PCI subsystem 1af4:1100
+      IRQ 11, pin A
+      BAR4: 64 bit prefetchable memory at 0x382000000000 [0x382000003fff].
+      id "balloon0"
+  Bus  0, device   2, function 5:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 7.
+      subordinate bus 7.
+      IO range [0xf000, 0x0fff]
+      memory range [0x89200000, 0x893fffff]
+      prefetchable memory range [0x382800000000, 0x382fffffffff]
+      BAR0: 32 bit memory at 0x89f90000 [0x89f90fff].
+      id "pci.6"
+  Bus  0, device   2, function 6:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 8.
+      subordinate bus 8.
+      IO range [0xf000, 0x0fff]
+      memory range [0x89000000, 0x891fffff]
+      prefetchable memory range [0x383000000000, 0x3837ffffffff]
+      BAR0: 32 bit memory at 0x89f8f000 [0x89f8ffff].
+      id "pci.7"
+  Bus  0, device   2, function 7:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 9.
+      subordinate bus 9.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88e00000, 0x88ffffff]
+      prefetchable memory range [0x383800000000, 0x383fffffffff]
+      BAR0: 32 bit memory at 0x89f8e000 [0x89f8efff].
+      id "pci.8"
+  Bus  0, device   3, function 0:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 10.
+      subordinate bus 10.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88c00000, 0x88dfffff]
+      prefetchable memory range [0x384000000000, 0x3847ffffffff]
+      BAR0: 32 bit memory at 0x89f8d000 [0x89f8dfff].
+      id "pci.9"
+  Bus  0, device   3, function 1:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 11.
+      subordinate bus 11.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88a00000, 0x88bfffff]
+      prefetchable memory range [0x384800000000, 0x384fffffffff]
+      BAR0: 32 bit memory at 0x89f8c000 [0x89f8cfff].
+      id "pci.10"
+  Bus  0, device   3, function 2:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 12.
+      subordinate bus 12.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88800000, 0x889fffff]
+      prefetchable memory range [0x385000000000, 0x3857ffffffff]
+      BAR0: 32 bit memory at 0x89f8b000 [0x89f8bfff].
+      id "pci.11"
+  Bus  0, device   3, function 3:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 13.
+      subordinate bus 13.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88600000, 0x887fffff]
+      prefetchable memory range [0x385800000000, 0x385fffffffff]
+      BAR0: 32 bit memory at 0x89f8a000 [0x89f8afff].
+      id "pci.12"
+  Bus  0, device   3, function 4:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 14.
+      subordinate bus 14.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88400000, 0x885fffff]
+      prefetchable memory range [0x386000000000, 0x3867ffffffff]
+      BAR0: 32 bit memory at 0x89f89000 [0x89f89fff].
+      id "pci.13"
+  Bus  0, device   3, function 5:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 15.
+      subordinate bus 15.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88200000, 0x883fffff]
+      prefetchable memory range [0x386800000000, 0x386fffffffff]
+      BAR0: 32 bit memory at 0x89f88000 [0x89f88fff].
+      id "pci.14"
+  Bus  0, device   3, function 6:
+    PCI bridge: PCI device 1b36:000c
+      IRQ 11, pin A
+      BUS 0.
+      secondary bus 16.
+      subordinate bus 16.
+      IO range [0xf000, 0x0fff]
+      memory range [0x88000000, 0x881fffff]
+      prefetchable memory range [0x387000000000, 0x3877ffffffff]
+      BAR0: 32 bit memory at 0x89f87000 [0x89f87fff].
+      id "pci.15"
+  Bus  0, device  27, function 0:
+    Audio controller: PCI device 8086:293e
+      PCI subsystem 1af4:1100
+      IRQ 16, pin A
+      BAR0: 32 bit memory at 0x89f80000 [0x89f83fff].
+      id "sound0"
+  Bus  0, device  31, function 0:
+    ISA bridge: PCI device 8086:2918
+      PCI subsystem 1af4:1100
+      id ""
+  Bus  0, device  31, function 2:
+    SATA controller: PCI device 8086:2922
+      PCI subsystem 1af4:1100
+      IRQ 0, pin A
+      BAR4: I/O at 0x7040 [0x705f].
+      BAR5: 32 bit memory at 0x89f86000 [0x89f86fff].
+      id ""
+  Bus  0, device  31, function 3:
+    SMBus: PCI device 8086:2930
+      PCI subsystem 1af4:1100
+      IRQ 10, pin A
+      BAR4: I/O at 0x7000 [0x703f].
+      id ""
+
+
