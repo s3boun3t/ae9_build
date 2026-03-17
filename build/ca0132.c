@@ -4124,16 +4124,29 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		/*
-		 * AE-9: program NID 0x15 (WIDGET_CHIP_CTRL) so the 8051
-		 * activates stream 0x11 (HDA DMA→DSP).  The 8051 monitors
-		 * NID 0x15 for a stream tag; without it stream 0x11 stays
-		 * Active=0 and the DSP receives no PCM data.
+		 * AE-9 Direct Mode playback setup.
 		 *
-		 * Format MUST be 0x0047 (48kHz/32-bit/8ch) — this matches
-		 * stream 0x11's StreamFmt in the 8051 exram.  The 8051
-		 * compares the format on NID 0x15 with stream 0x11's config;
-		 * a mismatch prevents activation.  The actual HDA DMA format
-		 * (on NID 0x02) can differ — the DSP handles conversion.
+		 * Streams 0x05 (HDA→DSP), 0x0c (DSP→DAC), 0x18 (DSP→I2S)
+		 * are configured at boot by ae9_setup_defaults() and MUST NOT
+		 * be reconfigured here. Calling chipio_set_stream_source_dest
+		 * on an active stream destroys its exram allocation.
+		 *
+		 * pcm_prepare is called multiple times by PulseAudio probing
+		 * different formats, so this must be idempotent and fast.
+		 */
+		struct hdac_stream *hstr;
+		unsigned int ctrl_05 = 0;
+
+		codec_info(codec,
+			   "AE-9 pcm_prepare: tag=%d fmt=0x%04x\n",
+			   stream_tag, format);
+
+		/*
+		 * Phase 1: Program NID 0x15 (WIDGET_CHIP_CTRL) so the 8051
+		 * activates stream 0x05 (HDA→DSP). The 8051 monitors
+		 * NID 0x15 for a stream tag; without it the DSP gets no data.
+		 * Format 0x0047 (48kHz/32-bit/8ch) matches the 8051's
+		 * expectation regardless of actual userspace format.
 		 */
 		snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
 				    AC_VERB_SET_CHANNEL_STREAMID,
@@ -4142,59 +4155,45 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 				    AC_VERB_SET_STREAM_FORMAT, 0x0047);
 
 		/*
-		 * AE-9: prevent IOCE (bit 2 of SD_CTL).  The DSP DMA
-		 * stalls when IOCE is set.  no_period_wakeup=1 tells
-		 * snd_hdac_stream_start() to omit IOCE from SD_CTL.
-		 * Period updates are driven by ae9_period_timer instead.
+		 * Phase 2: Prevent IOCE (bit 2 of SD_CTL). The DSP DMA
+		 * stalls when IOCE is set. Period updates are driven by
+		 * ae9_period_timer instead.
 		 */
-		{
-			struct hdac_stream *hstr;
-
-			hstr = (struct hdac_stream *)
-				substream->runtime->private_data;
-			if (hstr) {
-				spec->ae9_hstr = hstr;
-				hstr->no_period_wakeup = 1;
-			}
+		hstr = (struct hdac_stream *)
+			substream->runtime->private_data;
+		if (hstr) {
+			spec->ae9_hstr = hstr;
+			hstr->no_period_wakeup = 1;
 		}
 
 		/*
-		 * AE-9: restart stream 0x05 (HDA→DSP) if inactive.
-		 * This stream is started at boot but goes inactive
-		 * after the first playback cycle or runtime PM.
-		 * It must be active for the DSP to receive PCM data.
-		 *
-		 * Also check stream 0x0c (DSP→DAC): its exram port
-		 * offset (0x1584) can be reset to 0xFF by select_out
-		 * calls at boot. If ports are gone, stop/restart 0x0c
-		 * to force the 8051 to reallocate them.
+		 * Phase 3: Restart stream 0x05 if it went inactive.
+		 * Boot starts it, but it can go inactive after the first
+		 * playback cycle or runtime PM. Do NOT reconfigure src/dst.
 		 */
-		{
-			unsigned int ctrl_05 = 0, off_0c = 0xff;
-
-			mutex_lock(&spec->chipio_mutex);
-			chipio_get_stream_control(codec, 0x05, &ctrl_05);
-			if (!ctrl_05)
-				chipio_set_stream_control(codec, 0x05, 1);
-
-			/* Check if stream 0x0c ports are allocated */
-			chipio_8051_read_exram(codec, 0x1584, &off_0c);
-			if (off_0c == 0xff) {
-				codec_info(codec,
-					   "AE-9: stream 0x0c ports lost, "
-					   "reallocating\n");
-				chipio_set_stream_control(codec, 0x0c, 0);
-				msleep(10);
-				chipio_set_stream_channels(codec, 0x0c, 6);
-				chipio_set_stream_control(codec, 0x0c, 1);
-				msleep(75);
-			}
-			mutex_unlock(&spec->chipio_mutex);
+		mutex_lock(&spec->chipio_mutex);
+		chipio_get_stream_control(codec, 0x05, &ctrl_05);
+		if (!ctrl_05) {
+			codec_info(codec,
+				   "AE-9 pcm_prepare: stream 0x05 inactive, restarting\n");
+			chipio_set_stream_control(codec, 0x05, 1);
+			msleep(50);
 		}
+
+		/*
+		 * Phase 4: Set ASI = 0x0f (Direct Mode, headphone).
+		 * Windows writes this at every playback cycle.
+		 */
+		chipio_set_control_param_no_mutex(codec,
+			CONTROL_PARAM_ASI, 0x0f);
+
+		mutex_unlock(&spec->chipio_mutex);
 
 		/* Start period timer and keepalive */
 		ae9_period_timer_start(spec, substream);
 		ae9_keepalive_start(spec);
+
+		codec_info(codec, "AE-9 pcm_prepare: DONE\n");
 	}
 
 	return 0;
@@ -7684,6 +7683,8 @@ static enum hrtimer_restart ae9_keepalive_callback(struct hrtimer *hrt)
 	static const u8 pkt_dac2[]   = {0xb1, 0x01, 0x02};
 	static const u8 pkt_dac3[]   = {0xb1, 0x01, 0x03};
 	static const u8 pkt_ack[]    = {0x21, 0x03, 0x02, 0x00, 0x00};
+	/* SBX OFF: Direct Mode (no SBX processing) */
+	static const u8 pkt_sbx_off[] = {0x03, 0x03, 0x02, 0x00, 0x40};
 
 	if (!spec->ae9_keepalive_active || !base)
 		return HRTIMER_NORESTART;
@@ -7720,6 +7721,7 @@ static enum hrtimer_restart ae9_keepalive_callback(struct hrtimer *hrt)
 		ae9_i2c_send_atomic(base, pkt_dac1,   sizeof(pkt_dac1));
 		ae9_i2c_send_atomic(base, pkt_dac2,   sizeof(pkt_dac2));
 		ae9_i2c_send_atomic(base, pkt_dac3,   sizeof(pkt_dac3));
+		ae9_i2c_send_atomic(base, pkt_sbx_off, sizeof(pkt_sbx_off));
 		ae9_i2c_send_atomic(base, pkt_ack,    sizeof(pkt_ack));
 
 		spec->ae9_keepalive_tick = 0;
@@ -9578,8 +9580,8 @@ static void ae9_acm_init(struct hda_codec *c)
 	/* TX#26: label "-24.5" */
 	static const u8 tx_lbl_245[] = {
 		0x11,0x09,0x2d,0x32,0x34,0x2e,0x35,0x00,0x00,0x00,0x00};
-	/* TX#27: gpio3 */
-	static const u8 tx_gpio3[]   = {0x03,0x03,0x02,0x40,0x40};
+	/* TX#27: gpio3 — SBX OFF + headphone flags (Direct Mode) */
+	static const u8 tx_gpio3[]   = {0x03,0x03,0x02,0x00,0x40};
 	/* TX#28: label "-15.0" */
 	static const u8 tx_lbl_150[] = {
 		0x11,0x09,0x2d,0x31,0x35,0x2e,0x30,0x00,0x00,0x00,0x00};
@@ -10291,6 +10293,15 @@ static void ca0132_init_chip(struct hda_codec *codec)
 	spec->voicefx_val = 0;
 	spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] = 1;
 	spec->effects_switch[CRYSTAL_VOICE - EFFECT_START_NID] = 0;
+
+	/*
+	 * AE-9 Direct Mode: disable all DSP playback effects (SBX).
+	 * The SBX LED on the ACM is controlled by the DSP effect state,
+	 * not by the I2C gpio3 packet.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] = 0;
+	}
 
 	/*
 	 * The ZxR doesn't have a front panel header, and it's line-in is on
