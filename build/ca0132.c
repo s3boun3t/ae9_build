@@ -4148,11 +4148,23 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		 * Format 0x0047 (48kHz/32-bit/8ch) matches the 8051's
 		 * expectation regardless of actual userspace format.
 		 */
-		snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
+		snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
 				    AC_VERB_SET_CHANNEL_STREAMID,
 				    (stream_tag << 4) | 0);
-		snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
-				    AC_VERB_SET_STREAM_FORMAT, 0x0047);
+		snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
+				    VENDOR_CHIPIO_STREAM_FORMAT,
+				    0x0047);
+		{
+			unsigned int v_conv;
+			v_conv = snd_hda_codec_read(codec,
+						    WIDGET_CHIP_CTRL, 0,
+						    AC_VERB_GET_CONV, 0);
+			codec_info(codec,
+				   "AE-9 pcm_prepare: NID 0x15 CONV=0x%02x "
+				   "(expect 0x%02x)\n",
+				   v_conv,
+				   (stream_tag << 4));
+		}
 
 		/*
 		 * Phase 2: Prevent IOCE (bit 2 of SD_CTL). The DSP DMA
