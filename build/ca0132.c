@@ -4143,28 +4143,24 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 
 		/*
 		 * Phase 1: Program NID 0x15 (WIDGET_CHIP_CTRL) so the 8051
-		 * activates stream 0x05 (HDA→DSP). The 8051 monitors
-		 * NID 0x15 for a stream tag; without it the DSP gets no data.
-		 * Format 0x0047 (48kHz/32-bit/8ch) matches the 8051's
+		 * activates stream 0x11 (HDA DMA→DSP). The 8051 monitors
+		 * NID 0x15 for a stream tag change; stream 0x11 data shows
+		 * HDA StreamID and StreamFmt are set from these verbs.
+		 *
+		 * Use snd_hda_codec_read (not write) to wait for 8051 ack.
+		 * Use VENDOR_CHIPIO_STREAM_FORMAT (0x200) instead of the
+		 * standard AC_VERB_SET_STREAM_FORMAT (0x2) — NID 0x15 is a
+		 * vendor widget, not a standard converter.
+		 *
+		 * Format 0x0047 (48kHz/32-bit/8ch) matches the firmware's
 		 * expectation regardless of actual userspace format.
 		 */
 		snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
-				    AC_VERB_SET_CHANNEL_STREAMID,
-				    (stream_tag << 4) | 0);
+				   AC_VERB_SET_CHANNEL_STREAMID,
+				   (stream_tag << 4) | 0);
 		snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
-				    VENDOR_CHIPIO_STREAM_FORMAT,
-				    0x0047);
-		{
-			unsigned int v_conv;
-			v_conv = snd_hda_codec_read(codec,
-						    WIDGET_CHIP_CTRL, 0,
-						    AC_VERB_GET_CONV, 0);
-			codec_info(codec,
-				   "AE-9 pcm_prepare: NID 0x15 CONV=0x%02x "
-				   "(expect 0x%02x)\n",
-				   v_conv,
-				   (stream_tag << 4));
-		}
+				   VENDOR_CHIPIO_STREAM_FORMAT,
+				   0x0047);
 
 		/*
 		 * Phase 2: Prevent IOCE (bit 2 of SD_CTL). The DSP DMA
@@ -8278,7 +8274,7 @@ static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 	 * are started in an unusual order" — including an incomplete set.
 	 *
 	 * Stream 0x05 (HDA→DSP) is still started later in ae9_setup_defaults()
-	 * AFTER ae9_post_dsp_stream_setup() sets its src=0x43/dst=0x00.
+	 * AFTER ae9_post_dsp_stream_setup() sets its src=0x43/dst=0xd0.
 	 * It gets DMA channel 3, after 0x0c/0x03/0x04 have channels 0/1/2.
 	 */
 	static const unsigned int dsp_dma_stream_ids[] = { 0x0c, 0x03, 0x04 };
@@ -8960,7 +8956,26 @@ static void ae9_post_dsp_mmio_commands(struct hda_codec *codec)
 	writeb(0x7f, spec->mem_base + 0x304);
 	writeb(0x00, spec->mem_base + 0x100);
 	writeb(0xff, spec->mem_base + 0x304);
-	writel(0x0, spec->mem_base + 0x86c);
+
+	/*
+	 * AE-9: DMA reset/enable sequence. BAR2+0x86c controls the DSP DMA
+	 * clock gate. Must be toggled 0→1 to activate DSP DMA transfers.
+	 * Without the re-enable to 1, DSP DMA channels stay in CH_START but
+	 * never reach ACTIVE state, causing complete audio silence.
+	 *
+	 * BAR2+0x800 = I2S clock config (0x6b = 48kHz base rate).
+	 * BAR2+0x804 = I2S/DMA config. Windows uses 0x49 for AE-9 during
+	 * playback (differs from AE-5's 0x57). Bit 0 must be set.
+	 *
+	 * Confirmed by comparing BAR2 registers Linux vs Windows via QEMU:
+	 *   Linux:  0x86c=0x00, 0x804=0x48  → DMA ACTIVE=0
+	 *   Windows: 0x86c=0x01, 0x804=0x49 → DMA active, audio plays
+	 */
+	writel(0x00, spec->mem_base + 0x86c);	/* reset DMA */
+	writel(0x6b, spec->mem_base + 0x800);	/* I2S clock config */
+	writel(0x01, spec->mem_base + 0x86c);	/* enable DMA */
+	writel(0x6b, spec->mem_base + 0x800);	/* re-apply clock */
+	writel(0x49, spec->mem_base + 0x804);	/* I2S/DMA config for AE-9 */
 }
 
 static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
@@ -8972,7 +8987,7 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 	 * on an active stream resets the 8051 exram allocation (offset→0xff).
 	 */
 	if (start_stream)
-		chipio_set_stream_source_dest(codec, 0x05, 0x43, 0x00);
+		chipio_set_stream_source_dest(codec, 0x05, 0x43, 0xd0);
 	else
 		ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x31);
 
