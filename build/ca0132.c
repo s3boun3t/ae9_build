@@ -3848,45 +3848,50 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int write_val;
 
-	/* Handshake (Connor's original, kept for compatibility) */
+	/*
+	 * Sync sequence — required before every CA0113 command.
+	 * Windows MMIO trace shows 0x7e/0x5a with readl barriers.
+	 */
 	writel(0x0000007e, spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 	writel(0x0000005a, spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 
-	/* Step 1: Wait for not busy (bit 23 = 0) */
-	if (ca0113_mmio_wait_ready(spec) < 0) {
-		codec_dbg(codec, "CA0113: timeout waiting ready for "
-			  "0x%02x/0x%02x=0x%02x\n", group, target, value);
-	}
-
 	/*
-	 * Step 2: Write type1 command mode.
-	 * Windows MMIO capture shows absolute writes to 0x20c — never
-	 * read-modify-write. Connor's original code did readl + mask +
-	 * set bits, which propagated bit 16 (ACK) if it was set by the
-	 * 8051. The AE-9 hardware enforces bit 16 strictly and the
-	 * propagation permanently corrupts the CA0113 state machine.
-	 * Absolute writes (0x800004, 0x800005) match Windows behavior.
+	 * Windows sequence (MMIO capture lines 4953-4970):
+	 *   1. Read 0x20c, write 0x800003 (mode 3), read back
+	 *   2. Read 0x804, write group, read back
+	 *   3. Read 0x20c, write 0x800005 (mode 5 = type1), read back
+	 *   4. Write (val<<8)|reg to 0x204, read back
+	 *   5. Wait ~16ms, check 0x860
+	 *   6. Write 0x800004 (end), clear 0x210
+	 *
+	 * Key difference from our old code: mode 3 BEFORE group,
+	 * then mode 5 BEFORE data. Not mode 4 → data → mode 5.
 	 */
-	writel(0x00800004, spec->mem_base + 0x20c);
-	wmb();
 
-	/* Step 3: Write group address */
+	/* Mode 3 first */
+	readl(spec->mem_base + 0x20c);
+	writel(0x00800003, spec->mem_base + 0x20c);
+	readl(spec->mem_base + 0x20c);
+
+	/* Group address */
+	readl(spec->mem_base + 0x804);
 	writel(group, spec->mem_base + 0x804);
-	wmb();
+	readl(spec->mem_base + 0x804);
 
-	/* Step 4: Write target + value to data register */
+	/* Mode 5 (type1 write trigger) */
+	readl(spec->mem_base + 0x20c);
+	writel(0x00800005, spec->mem_base + 0x20c);
+	readl(spec->mem_base + 0x20c);
+
+	/* Data: (value << 8) | target */
 	write_val = (target & 0xff) | (value << 8);
 	writel(write_val, spec->mem_base + 0x204);
-	wmb();
+	readl(spec->mem_base + 0x204);
 
-	/* Step 5: Trigger — type1 (bit 2) + execute (bit 0) */
-	writel(0x00800005, spec->mem_base + 0x20c);
-	wmb();
-
-	/* Step 6: Wait for response ready (bit 23 = 1) */
+	/* Wait for response ready (bit 23 = 1) */
 	if (ca0113_mmio_wait_response(spec) < 0) {
 		static int err_count;
 		if (err_count < 5) {
@@ -3902,8 +3907,8 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 
 	/* End command */
 	writel(0x00800004, spec->mem_base + 0x20c);
+	readl(spec->mem_base + 0x20c);
 	writel(0x00000000, spec->mem_base + 0x210);
-	readl(spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 }
 
@@ -3917,30 +3922,36 @@ static void ca0113_mmio_command_set_type2(struct hda_codec *codec,
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int write_val;
 
+	/* Sync sequence */
 	writel(0x0000007e, spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 	writel(0x0000005a, spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 
-	/* Wait for not busy */
-	if (ca0113_mmio_wait_ready(spec) < 0)
-		codec_dbg(codec, "CA0113 type2: timeout waiting ready\n");
+	/*
+	 * Type2 Windows sequence:
+	 *   1. Write 0x800001 (mode 1), read back
+	 *   2. Write group to 0x804, read back
+	 *   3. Write 0x800003 (mode 3 = type2 trigger), read back
+	 *   4. Write (val<<8)|reg to 0x204, read back
+	 *   5. Wait, end with 0x800004
+	 */
+	readl(spec->mem_base + 0x20c);
+	writel(0x00800001, spec->mem_base + 0x20c);
+	readl(spec->mem_base + 0x20c);
 
-	/* Set type2 mode — absolute write like Windows */
-	writel(0x00800002, spec->mem_base + 0x20c);
-	wmb();
-
+	readl(spec->mem_base + 0x804);
 	writel(group, spec->mem_base + 0x804);
-	wmb();
+	readl(spec->mem_base + 0x804);
+
+	readl(spec->mem_base + 0x20c);
+	writel(0x00800003, spec->mem_base + 0x20c);
+	readl(spec->mem_base + 0x20c);
 
 	write_val = (target & 0xff) | (value << 8);
 	writel(write_val, spec->mem_base + 0x204);
-	wmb();
-
-	/* Trigger — type2 (bit 1) + execute (bit 0) */
-	writel(0x00800003, spec->mem_base + 0x20c);
-	wmb();
+	readl(spec->mem_base + 0x204);
 
 	/* Wait for response */
 	if (ca0113_mmio_wait_response(spec) < 0) {
@@ -3951,8 +3962,8 @@ static void ca0113_mmio_command_set_type2(struct hda_codec *codec,
 	}
 
 	writel(0x00800004, spec->mem_base + 0x20c);
+	readl(spec->mem_base + 0x20c);
 	writel(0x00000000, spec->mem_base + 0x210);
-	readl(spec->mem_base + 0x210);
 	readl(spec->mem_base + 0x210);
 }
 
@@ -10022,6 +10033,60 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		readl(mem + 0x20c);
 		writel(0x00, mem + 0x210);
 		readl(mem + 0x210);
+
+		/*
+		 * Step 12: Re-sync and verify with a real command.
+		 * Windows MMIO capture (line 4947-4970) shows that after
+		 * the handshake token, Windows does a SECOND sync sequence
+		 * (0x7e/0x5a → 0xaa) then sends an actual type1 command
+		 * using mode 5 (0x800005). Without this re-sync, the
+		 * CA0113 bridge does not execute subsequent commands.
+		 *
+		 * First real command: ES9038 reg 0x01 = 0x07 (I2S config)
+		 * Data format: (val << 8) | reg = 0x0107
+		 */
+		readl(mem + 0x210);
+		writel(0x7e, mem + 0x210);
+		readl(mem + 0x210);
+		writel(0x5a, mem + 0x210);
+		sync_val = readl(mem + 0x210);
+		if (sync_val != 0xaa)
+			sync_val = readl(mem + 0x210);
+
+		codec_info(codec,
+			   "AE-9: CA0113 re-sync: 0x210=0x%08x\n",
+			   sync_val);
+
+		if (sync_val == 0xaa) {
+			/* Send type1 command: group=0x48, mode=5, reg1=0x07 */
+			readl(mem + 0x20c);
+			writel(0x00800003, mem + 0x20c);
+			readl(mem + 0x20c);
+
+			readl(mem + 0x804);
+			writel(0x48, mem + 0x804);
+			readl(mem + 0x804);
+
+			readl(mem + 0x20c);
+			writel(0x00800005, mem + 0x20c);
+			readl(mem + 0x20c);
+
+			writel(0x0107, mem + 0x204);
+			readl(mem + 0x204);
+
+			msleep(20);
+			codec_info(codec,
+				   "AE-9: CA0113 first cmd: 0x20c=0x%08x 0x860=%d 0x854=%d\n",
+				   readl(mem + 0x20c),
+				   readl(mem + 0x860),
+				   readl(mem + 0x854));
+
+			/* End command */
+			writel(0x00800004, mem + 0x20c);
+			readl(mem + 0x20c);
+			writel(0x00, mem + 0x210);
+			readl(mem + 0x210);
+		}
 
 		/* Restore GPIO5 for DAC power */
 		writew(0x0105, mem + 0x320);
