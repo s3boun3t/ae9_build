@@ -4130,6 +4130,14 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		/*
+		 * AE-9: Windows CORB trace (corb_boot_4.txt) shows
+		 * NID 0x02 gets format 0x0031 (48kHz/32-bit/stereo)
+		 * regardless of the userspace format. The DSP expects
+		 * 32-bit I2S input. Override whatever ALSA negotiated.
+		 */
+		snd_hda_codec_write(codec, spec->dacs[0], 0,
+				    AC_VERB_SET_STREAM_FORMAT, 0x0031);
+		/*
 		 * AE-9 Direct Mode playback setup.
 		 *
 		 * Streams 0x05 (HDA→DSP), 0x0c (DSP→DAC), 0x18 (DSP→I2S)
@@ -4203,6 +4211,39 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			CONTROL_PARAM_ASI, 0x0f);
 
 		mutex_unlock(&spec->chipio_mutex);
+
+		/*
+		 * Phase 5: Program ES9038Q2M DAC for playback.
+		 * Windows MMIO trace (ae9_vfio_trace_windows_playback.log)
+		 * sends these 4 commands at EVERY pcm_prepare cycle:
+		 *   type2(0x48, 0x07, 0x00) — filter reset
+		 *   type1(0x48, 0x07, 0x81) — apodizing filter + system mute
+		 *   type1(0x49, 0x0a, 0x07) — DPLL B wide bandwidth
+		 *   type1(0x48, 0x1d, 0x40) — soft unmute (audio starts)
+		 * Without these, the DAC does not decode the I2S stream.
+		 */
+		ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x07, 0x81);
+		ca0113_mmio_command_set(codec, 0x49, 0x0a, 0x07);
+		ca0113_mmio_command_set(codec, 0x48, 0x1d, 0x40);
+
+		/*
+		 * Phase 6: Unmute DAC converters and enable HP pin.
+		 * Windows CORB trace (corb_boot_4.txt) unmutes NID 0x02,
+		 * 0x03, 0x04 (OUT L+R, gain=0x5A) and sets NID 0x10
+		 * pin_widget_ctl=0xC0 (HP out enable) at every playback.
+		 */
+		snd_hda_codec_write(codec, 0x02, 0,
+				    AC_VERB_SET_AMP_GAIN_MUTE,
+				    AMP_OUT_UNMUTE | 0x5a);
+		snd_hda_codec_write(codec, 0x03, 0,
+				    AC_VERB_SET_AMP_GAIN_MUTE,
+				    AMP_OUT_UNMUTE | 0x5a);
+		snd_hda_codec_write(codec, 0x04, 0,
+				    AC_VERB_SET_AMP_GAIN_MUTE,
+				    AMP_OUT_UNMUTE | 0x5a);
+		snd_hda_codec_write(codec, 0x10, 0,
+				    AC_VERB_SET_PIN_WIDGET_CONTROL, 0xc0);
 
 		/* Start period timer and keepalive */
 		ae9_period_timer_start(spec, substream);
@@ -9098,11 +9139,29 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 		 */
 		ca0113_mmio_command_set_type2(codec, 0x48, 0x0e, 0x00);
 		ca0113_mmio_command_set(codec, 0x48, 0x0e, 0x8a);
-		chipio_write_no_mutex(codec, 0x189000, 0x0001f101);
-		chipio_write_no_mutex(codec, 0x189004, 0x0001f101);
-		chipio_write_no_mutex(codec, 0x189008, 0x0001f101);
-		chipio_write_no_mutex(codec, 0x189024, 0x00014004);
+		/*
+		 * AE-9: Windows CORB trace (corb_boot_4.txt) shows these
+		 * ChipIO memory values differ from AE-5/AE-7:
+		 *   0x189000-008: 0x0001f100 (not 0x0001f101, bit 0 clear)
+		 *   0x189024:     0x00008005 (not 0x00014004)
+		 */
+		chipio_write_no_mutex(codec, 0x189000, 0x0001f100);
+		chipio_write_no_mutex(codec, 0x189004, 0x0001f100);
+		chipio_write_no_mutex(codec, 0x189008, 0x0001f100);
+		chipio_write_no_mutex(codec, 0x189024, 0x00008005);
 		chipio_write_no_mutex(codec, 0x189028, 0x0002000f);
+		/*
+		 * AE-9: Windows CORB trace sends 4 ChipIO control params
+		 * that are not in the AE-5/AE-7 init sequence:
+		 *   param 0x7D = 0x15 (stream/routing config)
+		 *   param 0x90 = 0x14 (I2S output path)
+		 *   param 0x91 = 0x14 (I2S output path ch2)
+		 *   param 0xFC = 0x07 (unknown, sent before stream start)
+		 */
+		chipio_set_control_param_no_mutex(codec, 0x7d, 0x15);
+		chipio_set_control_param_no_mutex(codec, 0x90, 0x14);
+		chipio_set_control_param_no_mutex(codec, 0x91, 0x14);
+		chipio_set_control_param_no_mutex(codec, 0xfc, 0x07);
 		ca0113_mmio_command_set_type2(codec, 0x48, 0x10, 0x00);
 		ca0113_mmio_command_set(codec, 0x48, 0x07, 0x81);
 	}
@@ -9834,6 +9893,145 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 
 	codec_info(codec, "AE-9: DSP ready, starting post-DSP setup\n");
 	ae9_post_dsp_mmio_commands(codec);
+
+	/*
+	 * AE-9: CA0113 handshake — wake the CA0113 command interface.
+	 *
+	 * Windows MMIO capture (ae9_mmio_capture.txt, lines 4907-4940)
+	 * shows this sequence AFTER the DSP firmware is downloaded and
+	 * BEFORE any ca0113_mmio_command_set() calls:
+	 *
+	 *   1. Write 0x100 to 0x320 (GPIO pin 0 enable, NOT GPIO5)
+	 *   2. Write 0x7e to 0x210, read back (sync magic)
+	 *   3. Write 0x5a to 0x210, read back → expect 0xaa
+	 *   4. Write 0x800001 to 0x20c (mode 1)
+	 *   5. Write 0x48 to 0x804 (group = ES9038 addr)
+	 *   6. Write 0x800003 to 0x20c (mode 3 = command)
+	 *   7. Write 0x07 to 0x204 (target = reg 7)
+	 *   8. Wait ~16ms, poll 0x860=1, 0x854=1
+	 *   9. Write 0xffff to 0x208 (handshake token)
+	 *  10. Wait ~16ms, read 0x208 → expect 0xffffff00
+	 *  11. Write 0x800002 to 0x20c (end handshake)
+	 *
+	 * Without this handshake, the CA0113 accepts commands (bit 23
+	 * ack in 0x20c) but does NOT execute them — 0x854/0x860 stay 0
+	 * and no audio reaches the ES9038 DAC.
+	 *
+	 * 0x20c must still be at 0x800001 when we get here. If any
+	 * ca0113_mmio_command_set was called before this point, it
+	 * would have changed 0x20c to 0x800004 and the handshake fails.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		void __iomem *mem = spec->mem_base;
+		unsigned int sync_val, status;
+		int i;
+
+		codec_info(codec,
+			   "AE-9: CA0113 handshake: 0x20c=0x%08x\n",
+			   readl(mem + 0x20c));
+
+		/* Step 1: GPIO pin 0 enable (Windows writes 0x100, not 0x105) */
+		writew(0x0100, mem + 0x320);
+		readw(mem + 0x320);
+		readw(mem + 0x320);
+
+		/* Step 2-3: Sync sequence (exact Windows pattern) */
+		writel(0x7e, mem + 0x210);
+		sync_val = readl(mem + 0x210);
+
+		writel(0x5a, mem + 0x210);
+		sync_val = readl(mem + 0x210);
+		if (sync_val != 0xaa)
+			sync_val = readl(mem + 0x210);
+
+		if (sync_val != 0xaa) {
+			codec_warn(codec,
+				   "AE-9: CA0113 sync failed (0x210=0x%08x, want 0xaa)\n",
+				   sync_val);
+			/* Restore GPIO5 and continue without handshake */
+			writew(0x0105, mem + 0x320);
+			goto handshake_done;
+		}
+
+		codec_info(codec, "AE-9: CA0113 sync OK (0xaa)\n");
+
+		/*
+		 * Step 4-7: Send CA0113 command with read-after-write.
+		 * Windows reads each register before/after every write.
+		 * The read-backs are PCI posting barriers that ensure
+		 * the CA0113 processes each write before the next.
+		 */
+		/* Read 0x20c, rewrite mode 1 (Windows pattern) */
+		readl(mem + 0x20c);
+		writel(0x00800001, mem + 0x20c);
+		readl(mem + 0x20c);
+
+		/* Read 0x804, write group, read back */
+		readl(mem + 0x804);
+		writel(0x48, mem + 0x804);
+		readl(mem + 0x804);
+
+		/* Read 0x20c, write mode 3, read back */
+		readl(mem + 0x20c);
+		writel(0x00800003, mem + 0x20c);
+		readl(mem + 0x20c);
+
+		/* Write target reg, read back */
+		writel(0x07, mem + 0x204);
+		readl(mem + 0x204);
+
+		/*
+		 * Step 8: Wait ~16ms for 8051 to process.
+		 * Windows reads 0x20c=0x810003 (bit 16 set by 8051),
+		 * then 0x860=1, 0x854=1, 0x840=1.
+		 */
+		msleep(20);
+		status = readl(mem + 0x20c);
+		codec_info(codec,
+			   "AE-9: CA0113 after cmd: 0x20c=0x%08x (want 0x810003)\n",
+			   status);
+		codec_info(codec,
+			   "AE-9: CA0113 cmd status: 0x860=%d 0x854=%d 0x840=%d\n",
+			   readl(mem + 0x860), readl(mem + 0x854),
+			   readl(mem + 0x840));
+
+		/*
+		 * Step 9-10: Handshake token.
+		 * Windows reads 0x20c, rewrites 0x800003, reads back,
+		 * then writes 0xffff to 0x208, reads back 0xffffffff,
+		 * waits 16ms, reads 0x208=0xffffff00.
+		 */
+		readl(mem + 0x20c);
+		writel(0x00800003, mem + 0x20c);
+		readl(mem + 0x20c);
+		writel(0xffff, mem + 0x208);
+		readl(mem + 0x208);
+		msleep(20);
+		status = readl(mem + 0x208);
+		codec_info(codec,
+			   "AE-9: CA0113 handshake: 0x208=0x%08x (want 0xffffff00)\n",
+			   status);
+
+		/*
+		 * Step 11: End handshake.
+		 * Windows writes 0x800002 to 0x20c, reads back,
+		 * then clears 0x210 to 0.
+		 */
+		readl(mem + 0x20c);
+		writel(0x00800002, mem + 0x20c);
+		readl(mem + 0x20c);
+		writel(0x00, mem + 0x210);
+		readl(mem + 0x210);
+
+		/* Restore GPIO5 for DAC power */
+		writew(0x0105, mem + 0x320);
+
+		spec->ca0113_ready = true;
+		codec_info(codec,
+			   "AE-9: CA0113 handshake complete, 0x20c=0x%08x\n",
+			   readl(mem + 0x20c));
+	}
+handshake_done:
 	ca0132_alt_init_analog_mics(codec);
 	ca0132_alt_start_dsp_audio_streams(codec);
 	ca0132_alt_dsp_initial_mic_setup(codec);
