@@ -4207,9 +4207,9 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 				   0x0047);
 
 		/*
-		 * Phase 2: Prevent IOCE (bit 2 of SD_CTL). The DSP DMA
-		 * stalls when IOCE is set. Period updates are driven by
-		 * ae9_period_timer instead.
+		 * Phase 2: Get stream descriptor reference.
+		 * Clear IOCE (bit 2) which stalls DSP DMA.
+		 * Period updates are driven by ae9_period_timer.
 		 */
 		hstr = (struct hdac_stream *)
 			substream->runtime->private_data;
@@ -4256,7 +4256,20 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		mutex_unlock(&spec->chipio_mutex);
 
 		/*
-		 * Phase 5: ES9038Q2M DAC setup.
+		 * Phase 5: Windows Direct Mode pipeline activation.
+		 *
+		 * Decoded from corb_dump_direct.txt. These ChipIO writes
+		 * activate the DSP audio pipeline for headphone output.
+		 * Without them, DSP streams are active but audio doesn't
+		 * flow through the processing chain.
+		 */
+		chipio_write(codec, 0x18b008, 0x000000f0);
+		chipio_write(codec, 0x190060, 0x00014000);
+		chipio_write(codec, 0x190064, 0x00014101);
+		chipio_write(codec, 0x19042c, 0x00000001);
+
+		/*
+		 * Phase 6: ES9038Q2M DAC setup.
 		 *
 		 * DISABLED: The boot sequence (ae9_post_dsp_setup_ports)
 		 * already configures reg 0x07=0x80 (apodizing, unmuted)
@@ -5304,6 +5317,16 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 			err = dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ONE);
 		else
 			err = dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ZERO);
+
+		/*
+		 * AE-9: Windows Direct Mode CORB trace (corb_dump_direct.txt)
+		 * shows module 0x80 req 0x08 = FLOAT_EIGHT (8.0 = 2.0ch config)
+		 * sent during every playback cycle. Without this, the DSP may
+		 * not route audio to the output path.
+		 */
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			dspio_set_uint_param(codec, 0x80, 0x08, FLOAT_EIGHT);
+
 		codec_dbg(codec,
 			  "AE-9 select_out: dspio 0x80/0x04 err=%d outfx=%d\n",
 			  err, outfx_set);
