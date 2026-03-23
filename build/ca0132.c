@@ -4159,15 +4159,12 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		/*
-		 * AE-9: Windows CORB trace (corb_boot_4.txt) shows
-		 * NID 0x02 gets format 0x0031 (48kHz/32-bit/stereo)
-		 * regardless of the userspace format. The DSP expects
-		 * 32-bit I2S input. Override whatever ALSA negotiated.
-		 */
-		snd_hda_codec_write(codec, spec->dacs[0], 0,
-				    AC_VERB_SET_STREAM_FORMAT, 0x0031);
-		/*
 		 * AE-9 Direct Mode playback setup.
+		 *
+		 * ALSA now programs the SD with 8ch/32bit (0x0047) because
+		 * ae9_playback_pcm_open forces channels_min=8, S32_LE.
+		 * No need to override NID 0x02 format — snd_hda_codec_setup_stream
+		 * already sent the correct format to both the SD and the codec.
 		 *
 		 * Streams 0x05 (HDA→DSP), 0x0c (DSP→DAC), 0x18 (DSP→I2S)
 		 * are configured at boot by ae9_setup_defaults() and MUST NOT
@@ -8072,9 +8069,8 @@ static int ae9_playback_pcm_open(struct hda_pcm_stream *hinfo,
 
 	/*
 	 * AE-9: the DSP handles sample rate conversion internally.
-	 * VFIO traces show Windows uses 44.1kHz (fmt 0x4015) for
-	 * headphone SBX mode. Allow all standard rates.
-	 * The I2S output to ES9038 is always 96kHz regardless.
+	 * AE-5/AE-7 work with 2-6 channels on the same DSP, so the
+	 * CA0132 does NOT require 8ch input despite Windows using it.
 	 */
 	hw->rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 		    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000;
@@ -8083,22 +8079,11 @@ static int ae9_playback_pcm_open(struct hda_pcm_stream *hinfo,
 	hw->channels_min = 2;
 	hw->channels_max = 6;
 
-	/*
-	 * Limit DMA buffer size to avoid -ENOMEM on contiguous allocation.
-	 * 16384 frames @ 48kHz/16bit/2ch = 64 kB, well within limits.
-	 */
 	hw->buffer_bytes_max = 65536;
 	hw->period_bytes_min = 256;
 	hw->period_bytes_max = 16384;
 	hw->periods_min = 2;
 	hw->periods_max = 8;
-
-	/*
-	 * AE-9: the CA0132 DSP firmware does not propagate BDL IOC interrupts.
-	 * Period updates are driven by ae9_period_timer (hrtimer). Do NOT set
-	 * SNDRV_PCM_INFO_BATCH here — it allows ALSA to skip period wakeups,
-	 * which breaks the software timer driven update path.
-	 */
 
 	return 0;
 }
@@ -8513,29 +8498,26 @@ static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 	 * It gets DMA channel 3, after 0x0c/0x03/0x04 have channels 0/1/2.
 	 */
 	static const unsigned int dsp_dma_stream_ids[] = { 0x0c, 0x03, 0x04 };
+	static const unsigned int ae9_dma_stream_ids[] = { 0x0c, 0x03, 0x04, 0x05 };
 	struct ca0132_spec *spec = codec->spec;
-	unsigned int n_streams = ARRAY_SIZE(dsp_dma_stream_ids);
+	const unsigned int *stream_ids;
+	unsigned int n_streams;
 	unsigned int i, tmp;
 
-	/*
-	 * AE-9: NEVER stop streams that are already running.
-	 * Stopping stream 0x0c destroys its exram allocation (offset
-	 * reverts to 0xff) and the 8051 does not recreate it on restart.
-	 * This kills the DSP→DAC audio path permanently.
-	 *
-	 * This function is called 7+ times during boot via select_out.
-	 * Only the first call (when streams are inactive) should start them.
-	 */
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
-		mutex_lock(&spec->chipio_mutex);
-		chipio_get_stream_control(codec, 0x0c, &tmp);
-		mutex_unlock(&spec->chipio_mutex);
-		if (tmp) {
-			codec_dbg(codec,
-				  "AE-9: streams already active, skipping restart\n");
-			return;
-		}
+		stream_ids = ae9_dma_stream_ids;
+		n_streams = ARRAY_SIZE(ae9_dma_stream_ids);
+	} else {
+		stream_ids = dsp_dma_stream_ids;
+		n_streams = ARRAY_SIZE(dsp_dma_stream_ids);
 	}
+
+	/*
+	 * AE-9 DIAG: guard removed temporarily to test if the full
+	 * stop → free_dma → start cycle activates DMA channels.
+	 * Previous guard prevented stop/restart to protect exram,
+	 * but this may also prevent DMA channel allocation.
+	 */
 
 	/*
 	 * Check if any of the default streams are active, and if they are,
@@ -8544,11 +8526,11 @@ static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 	mutex_lock(&spec->chipio_mutex);
 
 	for (i = 0; i < n_streams; i++) {
-		chipio_get_stream_control(codec, dsp_dma_stream_ids[i], &tmp);
+		chipio_get_stream_control(codec, stream_ids[i], &tmp);
 
 		if (tmp) {
 			chipio_set_stream_control(codec,
-					dsp_dma_stream_ids[i], 0);
+					stream_ids[i], 0);
 		}
 	}
 
@@ -8568,7 +8550,7 @@ static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 
 	for (i = 0; i < n_streams; i++) {
 		chipio_set_stream_control(codec,
-				dsp_dma_stream_ids[i], 1);
+				stream_ids[i], 1);
 
 		/* Give the DSP some time to setup the DMA channel. */
 		msleep(75);
@@ -9186,14 +9168,20 @@ static void ae9_post_dsp_mmio_commands(struct hda_codec *codec)
 static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 				      bool start_stream)
 {
+	struct ca0132_spec *spec = codec->spec;
+
 	/*
 	 * AE-9: only configure stream 0x05 src/dst on first call.
 	 * Same protection as stream 0x18 — calling set_stream_source_dest
 	 * on an active stream resets the 8051 exram allocation (offset→0xff).
+	 *
+	 * For AE-9, stream 0x05 src/dst is configured in ae9_setup_defaults
+	 * BEFORE ca0132_alt_start_dsp_audio_streams() starts it with DMA.
+	 * Do NOT reconfigure here — it would destroy the DMA channel.
 	 */
-	if (start_stream)
+	if (start_stream && ca0132_quirk(spec) != QUIRK_AE9)
 		chipio_set_stream_source_dest(codec, 0x05, 0x43, 0xd0);
-	else
+	else if (!start_stream)
 		ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x31);
 
 	if (start_stream) {
@@ -10177,6 +10165,20 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	}
 handshake_done:
 	ca0132_alt_init_analog_mics(codec);
+
+	/*
+	 * AE-9: configure stream 0x05 (HDA→DSP) src/dst BEFORE starting
+	 * all DSP streams. This way when ca0132_alt_start_dsp_audio_streams
+	 * does the stop→free_dma→start cycle, stream 0x05 is included
+	 * and gets DMA channel 3.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		mutex_lock(&spec->chipio_mutex);
+		chipio_set_stream_source_dest(codec, 0x05, 0x43, 0xd0);
+		chipio_set_stream_channels(codec, 0x05, 2);
+		mutex_unlock(&spec->chipio_mutex);
+	}
+
 	ca0132_alt_start_dsp_audio_streams(codec);
 	ca0132_alt_dsp_initial_mic_setup(codec);
 
@@ -10307,15 +10309,10 @@ handshake_done:
 	}
 
 	/*
-	 * AE-9: start stream 0x05 (HDA→DSP) AFTER ae9_post_dsp_stream_setup()
-	 * has configured its source (0x43) and dest (0x00). Starting it earlier
-	 * in ca0132_alt_start_dsp_audio_streams() would lock in the 8051 default
-	 * ports (src=0x3b, dst=0x4d).
+	 * AE-9: stream 0x05 DMA allocation is now handled in
+	 * ca0132_alt_start_dsp_audio_streams() as part of the
+	 * {0x0c, 0x03, 0x04, 0x05} DMA cycle.
 	 */
-	mutex_lock(&spec->chipio_mutex);
-	chipio_set_stream_control(codec, 0x05, 1);
-	mutex_unlock(&spec->chipio_mutex);
-	codec_info(codec, "AE-9: stream 0x05 started after source/dest setup\n");
 
 	/* AE-9 DEBUG: verify stream pipeline is active after ASI setup */
 	{
