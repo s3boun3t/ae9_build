@@ -1358,22 +1358,22 @@ static const struct hda_pintbl ae9_pincfgs[] = {
 	/*
 	 * Pin configs for AE-9 (SSID 11020071).
 	 *
-	 * Critical: 0x0f must use DefAssoc=2 (separate group from line_outs
-	 * which use Assoc=1) so HDA autoconfig classifies it as hp_outs[0].
-	 * With Assoc=1 it conflicts with 0x0b and ends up in line_outs.
+	 * From Creative oem19.inf PinConfig\11020071 section.
+	 * NID 0x0F is Line Out (NOT HP Out!) with PresenceDetectOverride,
+	 * same as AE-5 in the INF. All pins in Association 1.
 	 *
-	 * 0x0f: Jack, Rear, HP Out, 1/8-jack, Black, Assoc=2, Seq=0
-	 * 0x0b: Jack, Int, Line Out, 1/8-jack, Green, Assoc=1, Seq=0
-	 * 0x11: Not-connected (it is LineMicIn2 on AE-9, not a HP jack)
+	 * Previous config had 0x0F as HP Out in Assoc=2 which caused
+	 * autoconfig to create a separate hp_outs entry. Windows treats
+	 * all outputs as line_outs in the same group.
 	 */
-	{ 0x0b, 0x01014110 }, /* Port G: Line Out (Assoc=1) */
-	{ 0x0c, 0x014510f0 }, /* SPDIF Out 1 */
+	{ 0x0b, 0x01017010 }, /* Port G: Line Out Front L/R (INF) */
+	{ 0x0c, 0x414510f0 }, /* SPDIF Out: Not connected (INF) */
 	{ 0x0d, 0x414510f0 }, /* SPDIF Out 2: not connected */
 	{ 0x0e, 0x01c520f0 }, /* SPDIF In */
-	{ 0x0f, 0x02214020 }, /* Port A: HP Out (ACM jack, Assoc=2, Seq=0) */
-	{ 0x10, 0x01016011 }, /* Port D: Center/LFE or FP HP */
-	{ 0x11, 0x41013014 }, /* Port B: not-connected (LineMicIn2) */
-	{ 0x12, 0x01a190f0 }, /* Port C: Mic-In / LineIn1 */
+	{ 0x0f, 0x01017114 }, /* Port A: Line Out, PresDetect=Override (INF) */
+	{ 0x10, 0x01017011 }, /* Port D: Center/LFE or FP HP (INF) */
+	{ 0x11, 0x41a170ff }, /* Port B: not-connected (INF) */
+	{ 0x12, 0x01a170f0 }, /* Port C: LineMicIn1 (INF) */
 	{ 0x13, 0x908700f0 }, /* What U Hear In */
 	{ 0x18, 0x500000f0 }, /* N/A */
 	{}
@@ -3877,9 +3877,9 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 	 * then mode 5 BEFORE data. Not mode 4 → data → mode 5.
 	 */
 
-	/* Mode 3 first */
+	/* Mode 5 first (Windows uses mode5, not mode3, for type1 commands) */
 	readl(spec->mem_base + 0x20c);
-	writel(0x00800003, spec->mem_base + 0x20c);
+	writel(0x00800005, spec->mem_base + 0x20c);
 	readl(spec->mem_base + 0x20c);
 
 	/* Group address */
@@ -3887,7 +3887,7 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 	writel(group, spec->mem_base + 0x804);
 	readl(spec->mem_base + 0x804);
 
-	/* Mode 5 (type1 write trigger) */
+	/* Mode 5 rewrite (Windows writes mode5 twice) */
 	readl(spec->mem_base + 0x20c);
 	writel(0x00800005, spec->mem_base + 0x20c);
 	readl(spec->mem_base + 0x20c);
@@ -8498,19 +8498,13 @@ static void ca0132_alt_start_dsp_audio_streams(struct hda_codec *codec)
 	 * It gets DMA channel 3, after 0x0c/0x03/0x04 have channels 0/1/2.
 	 */
 	static const unsigned int dsp_dma_stream_ids[] = { 0x0c, 0x03, 0x04 };
-	static const unsigned int ae9_dma_stream_ids[] = { 0x0c, 0x03, 0x04, 0x05 };
 	struct ca0132_spec *spec = codec->spec;
 	const unsigned int *stream_ids;
 	unsigned int n_streams;
 	unsigned int i, tmp;
 
-	if (ca0132_quirk(spec) == QUIRK_AE9) {
-		stream_ids = ae9_dma_stream_ids;
-		n_streams = ARRAY_SIZE(ae9_dma_stream_ids);
-	} else {
-		stream_ids = dsp_dma_stream_ids;
-		n_streams = ARRAY_SIZE(dsp_dma_stream_ids);
-	}
+	stream_ids = dsp_dma_stream_ids;
+	n_streams = ARRAY_SIZE(dsp_dma_stream_ids);
 
 	/*
 	 * AE-9 DIAG: guard removed temporarily to test if the full
@@ -9171,17 +9165,13 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 	struct ca0132_spec *spec = codec->spec;
 
 	/*
-	 * AE-9: only configure stream 0x05 src/dst on first call.
+	 * Configure stream 0x05 (HDA→DSP) source/dest.
 	 * Same protection as stream 0x18 — calling set_stream_source_dest
 	 * on an active stream resets the 8051 exram allocation (offset→0xff).
-	 *
-	 * For AE-9, stream 0x05 src/dst is configured in ae9_setup_defaults
-	 * BEFORE ca0132_alt_start_dsp_audio_streams() starts it with DMA.
-	 * Do NOT reconfigure here — it would destroy the DMA channel.
 	 */
-	if (start_stream && ca0132_quirk(spec) != QUIRK_AE9)
+	if (start_stream)
 		chipio_set_stream_source_dest(codec, 0x05, 0x43, 0xd0);
-	else if (!start_stream)
+	else
 		ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x31);
 
 	if (start_stream) {
@@ -10008,15 +9998,72 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			   "AE-9: CA0113 handshake: 0x20c=0x%08x\n",
 			   readl(mem + 0x20c));
 
-		/* Step 1: GPIO pin 0 enable (Windows writes 0x100, not 0x105) */
+		/*
+		 * CA0113 handshake — exact Windows VFIO trace reproduction.
+		 *
+		 * CRITICAL: Windows does NOT send any group (0x804) or
+		 * target reg (0x204) during the handshake. Our previous
+		 * code sent a fake command (group=0x48, reg=0x07) which
+		 * corrupted the handshake — 0x208 returned 0xffffff80
+		 * instead of 0xffff0001, and only the first post-handshake
+		 * command executed (0x860=1), all subsequent ones failed.
+		 *
+		 * Windows sequence from VFIO trace:
+		 *   0x20c = 0x800000  (mode 0 reset)
+		 *   0x20c = 0x800001  (mode 1)
+		 *   0x210 = 0x7e, 0x5a  (sync → 0xaa)
+		 *   0x20c = 0x800001  (rewrite mode 1)
+		 *   0x20c = 0x800003  (mode 3)
+		 *   0x20c = 0x800003  (rewrite mode 3)
+		 *   0x208 = 0xffff    (token)
+		 *   0x20c = 0x800002  (end handshake)
+		 *   0x210 = 0x00      (clear sync)
+		 *   re-sync 0x7e/0x5a → 0xaa
+		 *   first real command via mode 3→5
+		 */
+
+		/* Step 1: GPIO pin 0 enable */
 		writew(0x0100, mem + 0x320);
 		readw(mem + 0x320);
-		readw(mem + 0x320);
 
-		/* Step 2-3: Sync sequence (exact Windows pattern) */
+		/*
+		 * Step 1b: CA0113 command engine reset.
+		 * Windows VFIO lines 16-20: these registers initialize
+		 * the CA0113 bridge command engine BEFORE the handshake.
+		 * Without this, the CA0113 accepts the handshake but
+		 * cannot forward commands to the ES9038 DACs (0x860=0
+		 * for all group 0x48/0x49 commands).
+		 */
+		writel(0x00000aff, mem + 0x830);
+		readl(mem + 0x830);
+		writel(0x00000000, mem + 0x86c);
+		readl(mem + 0x86c);
+		msleep(14);  /* Windows waits ~14ms here */
+		writel(0x0000006b, mem + 0x800);
+		readl(mem + 0x800);
+		writel(0x00000001, mem + 0x86c);
+		readl(mem + 0x86c);
+		msleep(16);  /* Windows waits ~16ms here */
+		writel(0x0000006b, mem + 0x800);
+		readl(mem + 0x800);
+
+		/* Step 2: Group 0x57 + Mode 0 reset (Windows VFIO lines 21-22) */
+		writel(0x57, mem + 0x804);
+		readl(mem + 0x804);
+		writel(0x00800000, mem + 0x20c);
+		readl(mem + 0x20c);
+		msleep(50);
+
+		/* Step 3: Group 0x57 + Mode 1 (Windows VFIO lines 929-930) */
+		writel(0x57, mem + 0x804);
+		readl(mem + 0x804);
+		writel(0x00800001, mem + 0x20c);
+		readl(mem + 0x20c);
+		msleep(400);  /* Windows waits ~400ms here */
+
+		/* Step 4: Sync */
 		writel(0x7e, mem + 0x210);
 		sync_val = readl(mem + 0x210);
-
 		writel(0x5a, mem + 0x210);
 		sync_val = readl(mem + 0x210);
 		if (sync_val != 0xaa)
@@ -10026,93 +10073,56 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			codec_warn(codec,
 				   "AE-9: CA0113 sync failed (0x210=0x%08x, want 0xaa)\n",
 				   sync_val);
-			/* Restore GPIO5 and continue without handshake */
 			writew(0x0105, mem + 0x320);
 			goto handshake_done;
 		}
 
 		codec_info(codec, "AE-9: CA0113 sync OK (0xaa)\n");
 
-		/*
-		 * Step 4-7: Send CA0113 command with read-after-write.
-		 * Windows reads each register before/after every write.
-		 * The read-backs are PCI posting barriers that ensure
-		 * the CA0113 processes each write before the next.
-		 */
-		/* Read 0x20c, rewrite mode 1 (Windows pattern) */
-		readl(mem + 0x20c);
+		/* Step 5: Mode 1 rewrite (Windows VFIO line 1095) */
 		writel(0x00800001, mem + 0x20c);
 		readl(mem + 0x20c);
 
-		/* Read 0x804, write group, read back */
-		readl(mem + 0x804);
+		/* Step 5b: Group 0x48 (Windows VFIO line 1096) */
 		writel(0x48, mem + 0x804);
 		readl(mem + 0x804);
 
-		/* Read 0x20c, write mode 3, read back */
-		readl(mem + 0x20c);
+		/* Step 6: Mode 3 (Windows VFIO line 1097) */
 		writel(0x00800003, mem + 0x20c);
 		readl(mem + 0x20c);
 
-		/* Write target reg, read back */
+		/* Step 6b: Target reg 0x07 (Windows VFIO line 1098) */
 		writel(0x07, mem + 0x204);
 		readl(mem + 0x204);
 
-		/*
-		 * Step 8: Wait ~16ms for 8051 to process.
-		 * Windows reads 0x20c=0x810003 (bit 16 set by 8051),
-		 * then 0x860=1, 0x854=1, 0x840=1.
-		 */
-		msleep(20);
-		status = readl(mem + 0x20c);
-		codec_info(codec,
-			   "AE-9: CA0113 after cmd: 0x20c=0x%08x (want 0x810003)\n",
-			   status);
-		codec_info(codec,
-			   "AE-9: CA0113 cmd status: 0x860=%d 0x854=%d 0x840=%d\n",
-			   readl(mem + 0x860), readl(mem + 0x854),
-			   readl(mem + 0x840));
-
-		/*
-		 * Step 9-10: Handshake token.
-		 * Windows reads 0x20c, rewrites 0x800003, reads back,
-		 * then writes 0xffff to 0x208, reads back 0xffffffff,
-		 * waits 16ms, reads 0x208=0xffffff00.
-		 */
-		readl(mem + 0x20c);
+		/* Step 7: Mode 3 rewrite (Windows VFIO line 1099) */
 		writel(0x00800003, mem + 0x20c);
 		readl(mem + 0x20c);
-		writel(0xffff, mem + 0x208);
-		readl(mem + 0x208);
-		msleep(20);
-		status = readl(mem + 0x208);
-		codec_info(codec,
-			   "AE-9: CA0113 handshake: 0x208=0x%08x (want 0xffffff00)\n",
-			   status);
 
 		/*
-		 * Step 11: End handshake.
-		 * Windows writes 0x800002 to 0x20c, reads back,
-		 * then clears 0x210 to 0.
+		 * Step 8: Token write (Windows VFIO line 1100).
+		 * CRITICAL: do NOT readl(0x208) after writing — the
+		 * readback may reset the token before the CA0113
+		 * processes it. Windows VFIO trace shows no reads here.
 		 */
-		readl(mem + 0x20c);
+		writel(0xffff, mem + 0x208);
+		/* No readl here! Just wait for CA0113 to process */
+		msleep(16);
+		status = readl(mem + 0x208);
+		codec_info(codec,
+			   "AE-9: CA0113 handshake token: 0x208=0x%08x (want 0xffff0001)\n",
+			   status);
+
+		/* Step 9: End handshake (mode 2) — Windows VFIO line 1101 */
 		writel(0x00800002, mem + 0x20c);
 		readl(mem + 0x20c);
 		writel(0x00, mem + 0x210);
 		readl(mem + 0x210);
 
 		/*
-		 * Step 12: Re-sync and verify with a real command.
-		 * Windows MMIO capture (line 4947-4970) shows that after
-		 * the handshake token, Windows does a SECOND sync sequence
-		 * (0x7e/0x5a → 0xaa) then sends an actual type1 command
-		 * using mode 5 (0x800005). Without this re-sync, the
-		 * CA0113 bridge does not execute subsequent commands.
-		 *
-		 * First real command: ES9038 reg 0x01 = 0x07 (I2S config)
-		 * Data format: (val << 8) | reg = 0x0107
+		 * Step 10: Re-sync and send first real command.
+		 * Windows does sync → mode 3 → group → mode 5 → data
 		 */
-		readl(mem + 0x210);
 		writel(0x7e, mem + 0x210);
 		readl(mem + 0x210);
 		writel(0x5a, mem + 0x210);
@@ -10125,8 +10135,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			   sync_val);
 
 		if (sync_val == 0xaa) {
-			/* Send type1 command: group=0x48, mode=5, reg1=0x07 */
-			readl(mem + 0x20c);
+			/* First real command: mode 3 → group 0x48 → mode 5 → data */
 			writel(0x00800003, mem + 0x20c);
 			readl(mem + 0x20c);
 
@@ -10134,11 +10143,11 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			writel(0x48, mem + 0x804);
 			readl(mem + 0x804);
 
-			readl(mem + 0x20c);
 			writel(0x00800005, mem + 0x20c);
 			readl(mem + 0x20c);
 
-			writel(0x0107, mem + 0x204);
+			/* Dummy data write to verify CA0113 executes */
+			writel(0x0028, mem + 0x204);  /* reg 0x28 = 0x00 (harmless) */
 			readl(mem + 0x204);
 
 			msleep(20);
@@ -10160,24 +10169,11 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 
 		spec->ca0113_ready = true;
 		codec_info(codec,
-			   "AE-9: CA0113 handshake complete, 0x20c=0x%08x\n",
-			   readl(mem + 0x20c));
+			   "AE-9: CA0113 handshake complete, 0x20c=0x%08x 0x208=0x%08x\n",
+			   readl(mem + 0x20c), readl(mem + 0x208));
 	}
 handshake_done:
 	ca0132_alt_init_analog_mics(codec);
-
-	/*
-	 * AE-9: configure stream 0x05 (HDA→DSP) src/dst BEFORE starting
-	 * all DSP streams. This way when ca0132_alt_start_dsp_audio_streams
-	 * does the stop→free_dma→start cycle, stream 0x05 is included
-	 * and gets DMA channel 3.
-	 */
-	if (ca0132_quirk(spec) == QUIRK_AE9) {
-		mutex_lock(&spec->chipio_mutex);
-		chipio_set_stream_source_dest(codec, 0x05, 0x43, 0xd0);
-		chipio_set_stream_channels(codec, 0x05, 2);
-		mutex_unlock(&spec->chipio_mutex);
-	}
 
 	ca0132_alt_start_dsp_audio_streams(codec);
 	ca0132_alt_dsp_initial_mic_setup(codec);
@@ -10227,6 +10223,31 @@ handshake_done:
 	ca0113_mmio_command_set(codec, 0x30, 0x28, 0x00);
 
 	ae9_post_dsp_asi_setup(codec);
+
+	/*
+	 * AE-9: HCI stream descriptor init.
+	 *
+	 * AE-5 (ae5_post_dsp_startup_data) and AE-7 (ae7_post_dsp_pll_setup)
+	 * both write to HCI 0x189000-0x189028 after the ASI setup. These
+	 * configure the stream descriptor area that the DSP firmware reads
+	 * to set up its internal DMA channels. Without these writes, the
+	 * firmware leaves DSPDMAC_ACTIVE (0x110FFC) at 0x00000000 and
+	 * audio never flows through the DSP.
+	 *
+	 * Values from AE-5 (same firmware, verified working):
+	 *   0x189000 = 0x0001f101  (stream 0 descriptor word 0)
+	 *   0x189004 = 0x0001f101  (stream 0 descriptor word 1)
+	 *   0x189024 = 0x00014004  (stream 4 descriptor word 0)
+	 *   0x189028 = 0x0002000f  (stream 4 descriptor word 1)
+	 *   0x18b03c = 0x00000012  (stream config register)
+	 */
+	mutex_lock(&spec->chipio_mutex);
+	chipio_write_no_mutex(codec, 0x189000, 0x0001f101);
+	chipio_write_no_mutex(codec, 0x189004, 0x0001f101);
+	chipio_write_no_mutex(codec, 0x189024, 0x00014004);
+	chipio_write_no_mutex(codec, 0x189028, 0x0002000f);
+	chipio_write_no_mutex(codec, 0x18b03c, 0x00000012);
+	mutex_unlock(&spec->chipio_mutex);
 
 	/*
 	 * AE-9: apply the 5 post-ASI commands from AE-7 that are absent in
@@ -10444,9 +10465,21 @@ static void ca0132_init_flags(struct hda_codec *codec)
 		chipio_set_control_flag(codec, CONTROL_FLAG_ADC_C_96KHZ, 1);
 		chipio_set_control_flag(codec, CONTROL_FLAG_SRC_RATE_96KHZ, 1);
 		chipio_set_control_flag(codec, CONTROL_FLAG_IDLE_ENABLE, 0);
-		chipio_set_control_flag(codec, CONTROL_FLAG_SPDIF2OUT, 0);
+		/*
+		 * AE-9: UseSPDIFDAC=1 in oem19.inf, and the reference
+		 * flag dump had SPDIF2OUT=ON. This routes audio through
+		 * the SPDIF/I2S path to the external DAC (ES9038Q2M).
+		 * All other alt_functions cards keep it OFF.
+		 */
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			chipio_set_control_flag(codec,
+					CONTROL_FLAG_SPDIF2OUT, 1);
+		else
+			chipio_set_control_flag(codec,
+					CONTROL_FLAG_SPDIF2OUT, 0);
 		chipio_set_control_flag(codec,
-				CONTROL_FLAG_PORT_D_10KOHM_LOAD, 0);
+				CONTROL_FLAG_PORT_D_10KOHM_LOAD,
+				ca0132_quirk(spec) == QUIRK_AE9 ? 1 : 0);
 		chipio_set_control_flag(codec,
 				CONTROL_FLAG_PORT_A_10KOHM_LOAD, 1);
 	} else {
