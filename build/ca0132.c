@@ -7841,8 +7841,9 @@ static enum hrtimer_restart ae9_keepalive_callback(struct hrtimer *hrt)
 	 * 32 ticks × 16ms ≈ 512ms.
 	 */
 	if (++spec->ae9_keepalive_tick >= 32) {
-		/* GPIO5 watchdog */
-		writew(0x0105, base + 0x320);
+		/* GPIO5 + GPIO4 watchdog: each writew sets one pin */
+		writew(0x0105, base + 0x320);  /* GPIO5 = DAC power */
+		writew(0x0104, base + 0x320);  /* GPIO4 = HP amp */
 
 		/* Full I2C keepalive cycle (15 packets) */
 		ae9_i2c_send_atomic(base, pkt_status, sizeof(pkt_status));
@@ -7876,8 +7877,9 @@ static void ae9_keepalive_start(struct ca0132_spec *spec)
 		return;
 	spec->ae9_keepalive_active = true;
 	spec->ae9_keepalive_tick = 0;
-	/* Assert GPIO5 immediately at playback start */
-	writew(0x0105, spec->mem_base + 0x320);
+	/* Assert GPIO5 + GPIO4 immediately at playback start */
+	writew(0x0105, spec->mem_base + 0x320);  /* GPIO5 = DAC power */
+	writew(0x0104, spec->mem_base + 0x320);  /* GPIO4 = HP amp */
 	hrtimer_start(&spec->ae9_keepalive_timer,
 		      ns_to_ktime(16000000ULL), HRTIMER_MODE_REL);
 }
@@ -10034,39 +10036,58 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		readw(mem + 0x320);
 
 		/*
-		 * Step 1b: CA0113 command engine reset.
-		 * Windows VFIO lines 16-20: these registers initialize
-		 * the CA0113 bridge command engine BEFORE the handshake.
-		 * Without this, the CA0113 accepts the handshake but
-		 * cannot forward commands to the ES9038 DACs (0x860=0
-		 * for all group 0x48/0x49 commands).
+		 * Step 1b: CA0113 command engine reset (2nd reset).
+		 * Windows VFIO Phase 5: 0x86c=0→1, 0x800=0x6b×2.
+		 * NOTE: 0x830 is NOT written in the 2nd reset (already
+		 * set by mmio_init), but keeping it is harmless.
 		 */
 		writel(0x00000aff, mem + 0x830);
 		readl(mem + 0x830);
 		writel(0x00000000, mem + 0x86c);
 		readl(mem + 0x86c);
-		msleep(14);  /* Windows waits ~14ms here */
+		msleep(14);
 		writel(0x0000006b, mem + 0x800);
 		readl(mem + 0x800);
 		writel(0x00000001, mem + 0x86c);
 		readl(mem + 0x86c);
-		msleep(16);  /* Windows waits ~16ms here */
+		msleep(16);
 		writel(0x0000006b, mem + 0x800);
 		readl(mem + 0x800);
 
-		/* Step 2: Group 0x57 + Mode 0 reset (Windows VFIO lines 21-22) */
-		writel(0x57, mem + 0x804);
-		readl(mem + 0x804);
-		writel(0x00800000, mem + 0x20c);
-		readl(mem + 0x20c);
-		msleep(50);
-
-		/* Step 3: Group 0x57 + Mode 1 (Windows VFIO lines 929-930) */
+		/*
+		 * Step 2: Group 0x57 + Mode 1 DIRECTLY.
+		 *
+		 * CRITICAL: Windows does NOT write mode 0 (0x800000) in
+		 * the second reset — mode 0 was already set by mmio_init.
+		 * Writing mode 0 here RESETS the CA0113 state machine
+		 * and causes all group 0x48/0x49 commands to fail (0x860=0).
+		 * Windows goes straight to mode 1 (0x800001).
+		 */
 		writel(0x57, mem + 0x804);
 		readl(mem + 0x804);
 		writel(0x00800001, mem + 0x20c);
 		readl(mem + 0x20c);
-		msleep(400);  /* Windows waits ~400ms here */
+
+		/*
+		 * Step 3: GPIO5 pulse (DAC power cycle).
+		 * Windows VFIO Phase 6: GPIO5 ON → ALL OFF → wait → GPIO0 ON.
+		 * This pulse wakes up the I2C bus to the DACs via the
+		 * CA0113 bridge. Without it, commands to group 0x48/0x49
+		 * are silently lost (0x860=0).
+		 */
+		readw(mem + 0x320);
+		writew(0x0105, mem + 0x320);   /* GPIO5 ON */
+		readw(mem + 0x320);
+		readw(mem + 0x320);
+		readw(mem + 0x320);
+		writew(0x0000, mem + 0x320);   /* ALL OFF */
+		readw(mem + 0x320);
+		readw(mem + 0x320);
+		msleep(16);                    /* Windows: ~16ms HDA scan */
+		readw(mem + 0x320);
+		writew(0x0100, mem + 0x320);   /* GPIO0 ON only */
+		readw(mem + 0x320);
+		readw(mem + 0x320);
 
 		/* Step 4: Sync */
 		writel(0x7e, mem + 0x210);
@@ -10108,12 +10129,12 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 
 		/*
 		 * Step 8: Token write (Windows VFIO line 1100).
-		 * CRITICAL: do NOT readl(0x208) after writing — the
-		 * readback may reset the token before the CA0113
-		 * processes it. Windows VFIO trace shows no reads here.
+		 * Windows writes 0xffff then immediately reads back
+		 * 0xffffff80. This is normal — 0xffffff80 is the
+		 * correct first-handshake response (confirmed by VFIO).
 		 */
 		writel(0xffff, mem + 0x208);
-		/* No readl here! Just wait for CA0113 to process */
+		readl(mem + 0x208);  /* PCI barrier, returns 0xffffff80 */
 		msleep(16);
 		status = readl(mem + 0x208);
 		codec_info(codec,
@@ -10178,6 +10199,80 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		codec_info(codec,
 			   "AE-9: CA0113 handshake complete, 0x20c=0x%08x 0x208=0x%08x\n",
 			   readl(mem + 0x20c), readl(mem + 0x208));
+
+		/*
+		 * Send ALL CA0113 DAC commands IMMEDIATELY after handshake,
+		 * BEFORE any DSP/chipio operations that would cause the 8051
+		 * to set bit 16 of 0x20c. Once bit 16 is set, the 8051
+		 * intercepts all CA0113 MMIO accesses and commands to group
+		 * 0x48/0x49 silently fail (0x860=0).
+		 *
+		 * Confirmed: first 3 commands here get 0x860=1 (25 mars).
+		 * Windows sends ALL CA0113 commands before bit 16 is set.
+		 *
+		 * These are extracted from ae9_post_dsp_asi_setup().
+		 * The chipio/DSP calls remain in ae9_post_dsp_asi_setup.
+		 */
+		ca0113_mmio_gpio_set(codec, 3, true);
+		ca0113_mmio_gpio_set(codec, 3, false);
+		ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x07, 0x01);
+		ca0113_mmio_command_set(codec, 0x49, 0x0a, 0x07);
+		ca0113_mmio_gpio_set(codec, 2, false);
+		ca0113_mmio_command_set(codec, 0x48, 0x1d, 0x40);
+		ca0113_mmio_gpio_set(codec, 3, true);
+		ca0113_mmio_gpio_set(codec, 1, false);
+
+		/* Volume/filter init */
+		ca0113_mmio_command_set(codec, 0x48, 0x01, 0xc0);
+		ca0113_mmio_command_set(codec, 0x48, 0x0a, 0x02);
+		ca0113_mmio_command_set(codec, 0x48, 0x0b, 0x20);
+		ca0113_mmio_command_set(codec, 0x48, 0x04, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x04, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x08, 0xff);
+		ca0113_mmio_command_set(codec, 0x48, 0x1d, 0x40);
+		ca0113_mmio_command_set(codec, 0x48, 0x0a, 0x06);
+		ca0113_mmio_command_set(codec, 0x48, 0x0c, 0x5f);
+		ca0113_mmio_command_set_type2(codec, 0x48, 0x0e, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x0e, 0x8a);
+		ca0113_mmio_command_set_type2(codec, 0x48, 0x10, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x07, 0x81);
+		ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x00);
+		ca0113_mmio_command_set(codec, 0x49, 0x04, 0x31);
+		ca0113_mmio_command_set(codec, 0x48, 0x10, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x0a, 0x02);
+		ca0113_mmio_command_set(codec, 0x49, 0x05, 0x31);
+		ca0113_mmio_command_set(codec, 0x49, 0x18, 0xff);
+		ca0113_mmio_command_set(codec, 0x49, 0x19, 0xff);
+		ca0113_mmio_command_set(codec, 0x49, 0x02, 0x31);
+		ca0113_mmio_command_set(codec, 0x49, 0x1a, 0x00);
+		ca0113_mmio_command_set(codec, 0x49, 0x1b, 0x70);
+		ca0113_mmio_command_set(codec, 0x49, 0x03, 0x31);
+		ca0113_mmio_command_set(codec, 0x49, 0x00, 0xff);
+		ca0113_mmio_command_set(codec, 0x49, 0x01, 0xff);
+		ca0113_mmio_command_set(codec, 0x49, 0x06, 0xff);
+		ca0113_mmio_command_set(codec, 0x49, 0x07, 0xff);
+		ca0113_mmio_command_set(codec, 0x49, 0x10, 0x7f);
+		ca0113_mmio_command_set(codec, 0x49, 0x0a, 0x07);
+		ca0113_mmio_gpio_set(codec, 4, true);
+
+		/* Unmute DAC */
+		ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x07, 0x80);
+		ca0113_mmio_command_set(codec, 0x49, 0x0a, 0x06);
+
+		/* Final config */
+		ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x07, 0x00);
+		ca0113_mmio_command_set_type2(codec, 0x49, 0x0e, 0x00);
+		ca0113_mmio_command_set(codec, 0x49, 0x0e, 0x01);
+		ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x1e);
+		ca0113_mmio_gpio_set(codec, 4, true);
+		ca0113_mmio_command_set(codec, 0x48, 0x10, 0x1e);
+
+		codec_info(codec,
+			   "AE-9: CA0113 early DAC init: 0x20c=0x%08x 0x860=%d\n",
+			   readl(mem + 0x20c), readl(mem + 0x860));
 	}
 handshake_done:
 	ca0132_alt_init_analog_mics(codec);
