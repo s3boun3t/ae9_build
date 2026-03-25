@@ -3877,9 +3877,18 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 	 * then mode 5 BEFORE data. Not mode 4 → data → mode 5.
 	 */
 
-	/* Mode 5 first (Windows uses mode5, not mode3, for type1 commands) */
+	/*
+	 * Windows VFIO trace (lines 1105-1108) shows type1 commands
+	 * use mode3 first, then group, then mode5, then data:
+	 *   0x20c = 0x800003  (mode 3)
+	 *   0x804 = group
+	 *   0x20c = 0x800005  (mode 5 = execute)
+	 *   0x204 = data
+	 */
+
+	/* Mode 3 first */
 	readl(spec->mem_base + 0x20c);
-	writel(0x00800005, spec->mem_base + 0x20c);
+	writel(0x00800003, spec->mem_base + 0x20c);
 	readl(spec->mem_base + 0x20c);
 
 	/* Group address */
@@ -3887,7 +3896,7 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 	writel(group, spec->mem_base + 0x804);
 	readl(spec->mem_base + 0x804);
 
-	/* Mode 5 rewrite (Windows writes mode5 twice) */
+	/* Mode 5 (execute) */
 	readl(spec->mem_base + 0x20c);
 	writel(0x00800005, spec->mem_base + 0x20c);
 	readl(spec->mem_base + 0x20c);
@@ -9245,10 +9254,8 @@ static void ae9_post_dsp_asi_setup(struct hda_codec *codec)
 	ca0113_mmio_gpio_set(codec, 3, true);
 	ca0113_mmio_gpio_set(codec, 3, false);
 	/*
-	 * AE-9: Windows MMIO trace shows type2(0x48,0x07,0x00) then
-	 * type1(0x48,0x07,0x01) here — NOT type2(0x48,0x07,0x81).
-	 * 0x01 = I2S 16-bit slave mode (initial setup).
-	 * 0x81 = I2S 32-bit comes later in stream_setup(true).
+	 * AE-9: type2 resets reg 0x07 to default, then type1 writes 0x01.
+	 * Windows MMIO trace shows this exact pattern here.
 	 */
 	ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x00);
 	ca0113_mmio_command_set(codec, 0x48, 0x07, 0x01);
