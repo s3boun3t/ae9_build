@@ -4262,44 +4262,7 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		mutex_unlock(&spec->chipio_mutex);
 
 		/*
-		 * Phase 5: Windows Direct Mode pipeline activation.
-		 *
-		 * Decoded from corb_dump_direct.txt. These ChipIO writes
-		 * activate the DSP audio pipeline for headphone output.
-		 * Without them, DSP streams are active but audio doesn't
-		 * flow through the processing chain.
-		 */
-		chipio_write(codec, 0x18b008, 0x000000f0);
-		chipio_write(codec, 0x190060, 0x00014000);
-		chipio_write(codec, 0x190064, 0x00014101);
-		chipio_write(codec, 0x19042c, 0x00000001);
-
-		/*
-		 * Phase 6: ES9038Q2M DAC setup.
-		 *
-		 * DISABLED: The boot sequence (ae9_post_dsp_setup_ports)
-		 * already configures reg 0x07=0x80 (apodizing, unmuted)
-		 * and volume regs 0x0f/0x10=0x04 (-2dB).
-		 *
-		 * The previous code sent:
-		 *   type2(0x48, 0x07, 0x00)  — filter reset
-		 *   type1(0x48, 0x07, 0x81)  — MUTE (bit 0=1!)
-		 *   type1(0x49, 0x0a, 0x07)  — DPLL (ES9038PRO, not Q2M)
-		 *   type1(0x48, 0x1d, 0x40)  — unmute via reg 29
-		 *
-		 * Problems:
-		 *  1. reg 7 = 0x81 explicitly mutes both DAC channels
-		 *  2. reg 0x1d (29) may not exist on ES9038Q2M (datasheet
-		 *     only documents up to reg 27)
-		 *  3. The keepalive timer was corrupting CA0113 state,
-		 *     so these commands likely never executed anyway
-		 *
-		 * If audio still doesn't work after the keepalive fix,
-		 * add DPLL config (0x49, 0x0a, 0x07) to boot sequence.
-		 */
-
-		/*
-		 * Phase 6: Unmute DAC converters and enable HP pin.
+		 * Phase 5: Unmute DAC converters and enable HP pin.
 		 * Windows CORB trace (corb_boot_4.txt) unmutes NID 0x02,
 		 * 0x03, 0x04 (OUT L+R, gain=0x5A) and sets NID 0x10
 		 * pin_widget_ctl=0xC0 (HP out enable) at every playback.
@@ -10327,44 +10290,13 @@ handshake_done:
 	ae9_post_dsp_asi_setup(codec);
 
 	/*
-	 * AE-9: HCI stream descriptor init.
-	 *
-	 * AE-5 (ae5_post_dsp_startup_data) and AE-7 (ae7_post_dsp_pll_setup)
-	 * both write to HCI 0x189000-0x189028 after the ASI setup. These
-	 * configure the stream descriptor area that the DSP firmware reads
-	 * to set up its internal DMA channels. Without these writes, the
-	 * firmware leaves DSPDMAC_ACTIVE (0x110FFC) at 0x00000000 and
-	 * audio never flows through the DSP.
-	 *
-	 * Values from AE-5 (same firmware, verified working):
-	 *   0x189000 = 0x0001f101  (stream 0 descriptor word 0)
-	 *   0x189004 = 0x0001f101  (stream 0 descriptor word 1)
-	 *   0x189024 = 0x00014004  (stream 4 descriptor word 0)
-	 *   0x189028 = 0x0002000f  (stream 4 descriptor word 1)
-	 *   0x18b03c = 0x00000012  (stream config register)
+	 * NOTE: HCI stream descriptors (0x189000-0x189028) and ASI param
+	 * are already set by ae9_post_dsp_stream_setup(true) called from
+	 * ae9_post_dsp_asi_setup() above, with AE-9 specific values:
+	 *   0x189000 = 0x0001f100  (bit 0 clear, unlike AE-5's 0x0001f101)
+	 *   0x189024 = 0x00008005  (differs from AE-5's 0x00014004)
+	 *   ASI = 7
 	 */
-	mutex_lock(&spec->chipio_mutex);
-	chipio_write_no_mutex(codec, 0x189000, 0x0001f101);
-	chipio_write_no_mutex(codec, 0x189004, 0x0001f101);
-	chipio_write_no_mutex(codec, 0x189024, 0x00014004);
-	chipio_write_no_mutex(codec, 0x189028, 0x0002000f);
-	chipio_write_no_mutex(codec, 0x18b03c, 0x00000012);
-	mutex_unlock(&spec->chipio_mutex);
-
-	/*
-	 * AE-9: apply the 5 post-ASI commands from AE-7 that are absent in
-	 * our AE-9 path. On AE-7 these appear immediately after the ASI setup
-	 * and activate the output signal path:
-	 *   GPIO 0 + GPIO 1 = true  (output amp enable sequence)
-	 *   0x48/0x0f = 0x04        (CA0113 command: volume/filter control)
-	 *   0x48/0x10 = 0x04        (CA0113 command: volume/filter control)
-	 *   0x48/0x07 = 0x80 type2  (CA0113 type2: sound filter preset)
-	 */
-	ca0113_mmio_gpio_set(codec, 0, true);
-	ca0113_mmio_gpio_set(codec, 1, true);
-	ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x04);
-	ca0113_mmio_command_set(codec, 0x48, 0x10, 0x04);
-	ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x80);
 
 	/*
 	 * AE-9 DIAG: dump audio router entries for streams 0x05, 0x0c, 0x11,
