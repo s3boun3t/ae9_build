@@ -1181,7 +1181,6 @@ struct ca0132_spec {
 	unsigned int ae9_keepalive_tick;	/* GPIO5 watchdog counter */
 	bool ae9_ioce_cleared;			/* IOCE cleared after trigger */
 	bool ca0113_ready;			/* CA0113 handshake completed */
-	struct delayed_work ae9_ca0113_work;	/* deferred CA0113 handshake */
 	atomic_t ae9_period_count;		/* diagnostic: period_elapsed calls */
 
 	/*
@@ -1681,7 +1680,7 @@ static int chipio_send(struct hda_codec *codec,
 		msleep(20);
 	} while (time_before(jiffies, timeout));
 
-	codec_info(codec, "AE-9 DEBUG: chipio_send TIMEOUT reg=0x%x data=0x%x\n",
+	codec_dbg(codec, "chipio_send TIMEOUT reg=0x%x data=0x%x\n",
 		   reg, data);
 	return -EIO;
 }
@@ -1986,12 +1985,9 @@ static void chipio_set_stream_channels(struct hda_codec *codec,
 static void chipio_set_stream_control(struct hda_codec *codec,
 				int streamid, int enable)
 {
-	/* DIAG: catch who kills stream 0x0c */
-	if (streamid == 0x0c && !enable) {
-		codec_info(codec,
-			   "AE-9 TRAP: stream 0x0c STOP called!\n");
-		dump_stack();
-	}
+	/* DIAG: log when stream 0x0c is stopped */
+	if (streamid == 0x0c && !enable)
+		codec_dbg(codec, "AE-9: stream 0x0c STOP\n");
 	chipio_set_control_param_no_mutex(codec,
 			CONTROL_PARAM_STREAM_ID, streamid);
 	chipio_set_control_param_no_mutex(codec,
@@ -4170,10 +4166,9 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		/*
 		 * AE-9 Direct Mode playback setup.
 		 *
-		 * ALSA now programs the SD with 8ch/32bit (0x0047) because
-		 * ae9_playback_pcm_open forces channels_min=8, S32_LE.
-		 * No need to override NID 0x02 format — snd_hda_codec_setup_stream
-		 * already sent the correct format to both the SD and the codec.
+		 * ae9_playback_pcm_open sets channels 2-6, S16/S24/S32.
+		 * snd_hda_codec_setup_stream already sent the correct
+		 * format to both the SD and the codec.
 		 *
 		 * Streams 0x05 (HDA→DSP), 0x0c (DSP→DAC), 0x18 (DSP→I2S)
 		 * are configured at boot by ae9_setup_defaults() and MUST NOT
@@ -5278,7 +5273,7 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 		}
 
 		/*
-		 * AE-9: the external DAC (CS43198) has no DSP bypass path.
+		 * AE-9: the external DAC (ES9038Q2M) has no DSP bypass path.
 		 * Always send FLOAT_ONE so the DSP passes signal through,
 		 * regardless of whether PlayEnhancement is enabled.
 		 */
@@ -7853,115 +7848,7 @@ static void ae9_keepalive_stop(struct ca0132_spec *spec)
 	hrtimer_cancel(&spec->ae9_keepalive_timer);
 }
 
-/*
- * AE-9 deferred CA0113 handshake.
- *
- * The CA0113 command interface (BAR2+0x208) only becomes responsive
- * ~30s after the full driver init (DSP download + ACM init + codec
- * enumeration). Any write to BAR2+0x20c before this point triggers
- * an ACK (bit 16) that permanently locks the register.
- *
- * This delayed_work runs 30 seconds after ae9_setup_defaults() to
- * perform the handshake and send all the CA0113 commands that were
- * skipped during boot (because ca0113_ready was false).
- */
 static void ae9_setup_defaults(struct hda_codec *codec);
-
-static void ae9_ca0113_deferred_work(struct work_struct *work)
-{
-	struct ca0132_spec *spec =
-		container_of(work, struct ca0132_spec,
-			     ae9_ca0113_work.work);
-	struct hda_codec *codec = spec->codec;
-	void __iomem *mem = spec->mem_base;
-	unsigned int val;
-	int i;
-
-	if (!mem || spec->ca0113_ready)
-		return;
-
-	codec_info(codec, "AE-9: deferred CA0113 handshake starting\n");
-
-	/* Handshake: 0x800003 to 0x20c, then 0xffff to 0x208 */
-	writel(0x00800003, mem + 0x20c);
-	readl(mem + 0x20c);
-	msleep(16);
-	writel(0x00800003, mem + 0x20c);
-	readl(mem + 0x20c);
-	writel(0xffff, mem + 0x208);
-	readl(mem + 0x208);
-
-	/* Poll up to 5 seconds */
-	for (i = 0; i < 100; i++) {
-		msleep(50);
-		val = readl(mem + 0x208);
-		if (val != 0xffffffff)
-			break;
-	}
-	codec_info(codec,
-		   "AE-9: CA0113 handshake: 0x208=0x%08x (poll %d)\n",
-		   val, i);
-
-	if (val == 0xffffffff) {
-		codec_warn(codec,
-			   "AE-9: CA0113 still dead after 30s delay\n");
-		spec->ca0113_ready = true; /* don't retry */
-		return;
-	}
-
-	/* Protocol state machine */
-	writel(0x00800002, mem + 0x20c);
-	readl(mem + 0x20c);
-	writel(0x00800003, mem + 0x20c);
-	readl(mem + 0x20c);
-	writel(0x48, mem + 0x804);
-	readl(mem + 0x804);
-	writel(0x00800005, mem + 0x20c);
-	readl(mem + 0x20c);
-	msleep(19);
-	writel(0x00800004, mem + 0x20c);
-	readl(mem + 0x20c);
-	writel(0x00800005, mem + 0x20c);
-	readl(mem + 0x20c);
-	writel(0x49, mem + 0x804);
-	readl(mem + 0x804);
-	writel(0x00800005, mem + 0x20c);
-	readl(mem + 0x20c);
-
-	/*
-	 * CA0113 is alive. Set the flag BEFORE sending commands
-	 * so ca0113_mmio_command_set() no longer returns early.
-	 */
-	spec->ca0113_ready = true;
-
-	/* Send all CA0113 commands that were skipped during boot */
-	ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x81);
-	ca0113_mmio_command_set(codec, 0x49, 0x0a, 0x07);
-	ca0113_mmio_gpio_set(codec, 2, false);
-	ca0113_mmio_command_set(codec, 0x48, 0x1d, 0x40);
-	ca0113_mmio_command_set(codec, 0x48, 0x0d, 0x00);
-	ca0113_mmio_command_set(codec, 0x48, 0x17, 0x00);
-	ca0113_mmio_command_set(codec, 0x48, 0x19, 0x00);
-	ca0113_mmio_command_set(codec, 0x48, 0x11, 0xff);
-	ca0113_mmio_command_set(codec, 0x48, 0x12, 0xff);
-	ca0113_mmio_command_set(codec, 0x48, 0x13, 0xff);
-	ca0113_mmio_command_set(codec, 0x48, 0x14, 0x7f);
-	ca0113_mmio_command_set(codec, 0x48, 0x1d, 0x80);
-
-	/* Disable SBX (turn off SBX LED on ACM) */
-	ca0132_pe_switch_set(codec);
-
-	/*
-	 * Now run the full ae9_setup_defaults() that was deferred from
-	 * ca0132_init(). The CA0113 is alive, so all ca0113_mmio_command_set
-	 * calls will work. This sets up streams, effects, ACM, GPIO, etc.
-	 */
-	codec_info(codec, "AE-9: running deferred ae9_setup_defaults\n");
-	ae9_setup_defaults(codec);
-
-	codec_info(codec,
-		   "AE-9: CA0113 alive, setup complete, SBX off\n");
-}
 
 /*
  * AE-9 hrtimer for period wakeup.
@@ -9136,8 +9023,6 @@ static void ae9_post_dsp_mmio_commands(struct hda_codec *codec)
 static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 				      bool start_stream)
 {
-	struct ca0132_spec *spec = codec->spec;
-
 	/*
 	 * Configure stream 0x05 (HDA→DSP) source/dest.
 	 * Same protection as stream 0x18 — calling set_stream_source_dest
@@ -9287,6 +9172,7 @@ static void ae9_post_dsp_asi_setup(struct hda_codec *codec)
 	ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x1e);
 	ca0113_mmio_gpio_set(codec, 4, true);
 	ca0113_mmio_command_set(codec, 0x48, 0x10, 0x1e);
+
 	mutex_unlock(&spec->chipio_mutex);
 }
 
@@ -9964,7 +9850,6 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		void __iomem *mem = spec->mem_base;
 		unsigned int sync_val, status;
-		int i;
 
 		codec_info(codec,
 			   "AE-9: CA0113 handshake: 0x20c=0x%08x\n",
@@ -10233,6 +10118,26 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		ca0113_mmio_gpio_set(codec, 4, true);
 		ca0113_mmio_command_set(codec, 0x48, 0x10, 0x1e);
 
+		/*
+		 * AE-9: Windows playback CA0113 sequence.
+		 *
+		 * VFIO trace shows Windows sends these 10 commands
+		 * (with sync) at every playback start. We must send
+		 * them here — the only window where 0x860=1.
+		 * After handshake_done, HDA verbs set bit 16 and
+		 * CA0113 group 0x48/0x49 commands stop reaching DAC.
+		 */
+		ca0113_mmio_command_set(codec, 0x48, 0x1d, 0x80);
+		ca0113_mmio_command_set(codec, 0x48, 0x0d, 0x40);
+		ca0113_mmio_command_set(codec, 0x48, 0x16, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x17, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x18, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x19, 0x00);
+		ca0113_mmio_command_set(codec, 0x48, 0x11, 0xff);
+		ca0113_mmio_command_set(codec, 0x48, 0x12, 0xff);
+		ca0113_mmio_command_set(codec, 0x48, 0x13, 0xff);
+		ca0113_mmio_command_set(codec, 0x48, 0x14, 0x7f);
+
 		codec_info(codec,
 			   "AE-9: CA0113 early DAC init: 0x20c=0x%08x 0x860=%d\n",
 			   readl(mem + 0x20c), readl(mem + 0x860));
@@ -10420,7 +10325,7 @@ handshake_done:
 	ca0113_mmio_gpio_set(codec, 3, false);
 	/*
 	 * AE-9: Windows MMIO trace shows 0x1e here (not 0x37).
-	 * These are ES9038B volume/filter preset registers.
+	 * These are ES9038PRO volume/filter preset registers.
 	 */
 	ca0113_mmio_command_set(codec, 0x49, 0x04, 0x1e);
 	ca0113_mmio_command_set(codec, 0x49, 0x05, 0x1e);
@@ -11476,8 +11381,6 @@ static void ca0132_mmio_init_ae9(struct hda_codec *codec)
  */
 static void ca0132_ca0113_init_ae9(struct hda_codec *codec)
 {
-	struct ca0132_spec *spec = codec->spec;
-
 	/*
 	 * AE-9: Pre-DSP GPIO setup only. The CA0113 command interface
 	 * is NOT alive yet at this point (0x208=0xffffffff). It only
@@ -11941,11 +11844,9 @@ static void ca0132_free(struct hda_codec *codec)
 	}
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
-	/* AE-9: ensure timers and deferred work are stopped */
-	if (ca0132_quirk(spec) == QUIRK_AE9) {
-		cancel_delayed_work_sync(&spec->ae9_ca0113_work);
+	/* AE-9: ensure timers are stopped */
+	if (ca0132_quirk(spec) == QUIRK_AE9)
 		ae9_period_timer_stop(spec);
-	}
 	snd_hda_power_up(codec);
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
@@ -12420,8 +12321,6 @@ static int ca0132_codec_probe(struct hda_codec *codec, const struct hda_device_i
 			      ae9_keepalive_callback,
 			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		spec->ae9_keepalive_active = false;
-		INIT_DELAYED_WORK(&spec->ae9_ca0113_work,
-				  ae9_ca0113_deferred_work);
 		break;
 	default:
 		spec->mixers[0] = ca0132_mixer;
