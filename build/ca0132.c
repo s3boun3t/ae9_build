@@ -2153,6 +2153,20 @@ static void chipio_enable_clocks(struct hda_codec *codec)
 	chipio_8051_write_pll_pmu_no_mutex(codec, 0x05, 0x0b);
 	chipio_8051_write_pll_pmu_no_mutex(codec, 0x06, 0xff);
 
+	/*
+	 * AE-9: PLL_PMU[0x0F] = 0xFF — confirmed real PLL write from
+	 * Windows CORB t=3 early boot (29 mars analysis).
+	 *
+	 * Windows sequence: read PLL_PMU[0x0F], write 0x77, then 0xFF.
+	 * Only the final value (0xFF) matters. This register controls
+	 * a clock divider needed before DSP firmware download.
+	 *
+	 * Verified by raw CORB decode: 0x70D(0x0F) + 0x70C(0xFF)
+	 * is a genuine PLL_PMU write (has the 0x70C commit verb).
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		chipio_8051_write_pll_pmu_no_mutex(codec, 0x0f, 0xff);
+
 	mutex_unlock(&spec->chipio_mutex);
 }
 
@@ -4199,8 +4213,10 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		 * standard AC_VERB_SET_STREAM_FORMAT (0x2) — NID 0x15 is a
 		 * vendor widget, not a standard converter.
 		 *
-		 * Format 0x0047 (48kHz/32-bit/8ch) matches the firmware's
-		 * expectation regardless of actual userspace format.
+		 * NOTE: stream_tag must match the HDA controller DMA tag.
+		 * Windows uses tag=1, Linux framework assigns tag=5+.
+		 * The tag value itself doesn't matter as long as both
+		 * sides match — the DSP firmware accepts any tag.
 		 */
 		snd_hda_codec_read(codec, WIDGET_CHIP_CTRL, 0,
 				   AC_VERB_SET_CHANNEL_STREAMID,
@@ -4434,14 +4450,16 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		}
 
 		/*
-		 * Phase 6: Trigger DSP I2S stream RUN.
+		 * Phase 6: I2C bus re-init (BAR2+0xC00-0xC0C).
 		 *
-		 * The I2S stream descriptor at BAR2+0xC00 controls the
-		 * data flow from DSP to the ACM via the HDMI cable.
-		 * ae9_stream_dsp_sequence.md shows Windows writes
-		 * 0xC0C=0x83 (LVI=3 + bit7=RUN) after DSP init.
-		 * Without this, 0xC0C stays at 0x03 and no I2S data
-		 * flows to the ACM — no relay click, no sound.
+		 * 0xC0C is the I2C FIFO control (NOT I2S output control).
+		 * Bit 7 = FIFO enable, cleared by hardware after processing.
+		 * The I2S output is controlled internally by the DSP DMA
+		 * (streams 0x0c/0x18, ACTIVE register at 0x110FFC).
+		 *
+		 * Windows writes 0xC0C=0x83 in the keepalive cycle to
+		 * re-init the I2C bus before sending status packets.
+		 * The readback 0x03 (bit 7 cleared) is normal behavior.
 		 */
 		if (spec->mem_base) {
 			unsigned int c0c_before, c0c_after, c14;
@@ -4457,6 +4475,39 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 				   "0xC0C: 0x%02x→0x%02x "
 				   "0xC14=0x%02x\n",
 				   c0c_before, c0c_after, c14);
+		}
+
+		/*
+		 * DIAG: DMA transfer counts — check if DSP processes audio.
+		 * DSPDMAC XFRCNT at 0x110F08 + chan*0x10 shows cumulative
+		 * DMA words transferred per channel. Read twice with a
+		 * 200ms gap — if counts advance, that channel is active.
+		 * Also read DSP DBGCNTL to verify DSP core is executing.
+		 */
+		{
+			unsigned int xfr0a, xfr1a, xfr2a;
+			unsigned int xfr0b, xfr1b, xfr2b;
+			unsigned int dbgcntl, active2;
+
+			chipio_read(codec, 0x110F08, &xfr0a);
+			chipio_read(codec, 0x110F18, &xfr1a);
+			chipio_read(codec, 0x110F28, &xfr2a);
+			chipio_read(codec, 0x100E30, &dbgcntl);
+
+			msleep(200);
+
+			chipio_read(codec, 0x110F08, &xfr0b);
+			chipio_read(codec, 0x110F18, &xfr1b);
+			chipio_read(codec, 0x110F28, &xfr2b);
+			chipio_read(codec, 0x110FFC, &active2);
+
+			codec_info(codec,
+				   "AE-9 DIAG DMA: ch0(HDA→DSP) %08x→%08x "
+				   "ch1(DSP→DAC) %08x→%08x "
+				   "ch2(DSP→I2S) %08x→%08x "
+				   "DBGCTL=0x%x ACTIVE=0x%x\n",
+				   xfr0a, xfr0b, xfr1a, xfr1b,
+				   xfr2a, xfr2b, dbgcntl, active2);
 		}
 	}
 
@@ -5247,7 +5298,12 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 		return 0;
 
 	out_info = &quirk_data->out_set_info[spec->cur_out_type];
-	if (quirk_data->is_ae_series)
+	/*
+	 * AE-9: ae5_mmio_select_out and ae5_headphone_gain_set are now
+	 * called BEFORE the DSP mute verb in ca0132_alt_select_out()
+	 * to avoid the CA0113 bit 16 problem. Skip them here.
+	 */
+	if (quirk_data->is_ae_series && ca0132_quirk(spec) != QUIRK_AE9)
 		ae5_mmio_select_out(codec);
 
 	if (out_info->has_hda_gpio) {
@@ -5291,6 +5347,15 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 	}
 
 	if (quirk_data->has_headphone_gain) {
+		/*
+		 * AE-9: HP gain was already sent before the DSP mute verb
+		 * in ca0132_alt_select_out() to avoid the CA0113 bit 16
+		 * problem. Don't send it again here — bit 16 is now set
+		 * and the CA0113 commands would silently fail (0x860=0).
+		 */
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			goto skip_gain;
+
 		if (spec->cur_out_type != HEADPHONE_OUT) {
 			if (quirk_data->is_ae_series)
 				ae5_headphone_gain_set(codec, 2);
@@ -5306,6 +5371,7 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 		}
 	}
 
+skip_gain:
 	return 0;
 }
 
@@ -5373,6 +5439,32 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 		spec->cur_out_type = spec->out_enum_val;
 
 	outfx_set = spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID];
+
+	/*
+	 * AE-9: CA0113 MMIO commands (output preset + HP gain) MUST be
+	 * sent BEFORE any HDA verb / SCP command. The CA0132 8051 sets
+	 * bit 16 of BAR2+0x20c on the first HDA verb (chipio or dspio),
+	 * which causes all subsequent CA0113 MMIO commands to silently
+	 * fail (0x860=0). This bit 16 is sticky and survives even
+	 * explicit writes of 0x00800003 to 0x20c.
+	 *
+	 * Windows solves this by sending CA0113 commands in a separate
+	 * phase before the DSP verbs. Our previous code sent the DSP
+	 * mute verb first (dspio_set_uint_param → NID 0x16 → bit 16),
+	 * then called ca0132_alt_select_out_quirk_set() which contains
+	 * ae5_mmio_select_out() and ae5_headphone_gain_set() — all of
+	 * which failed silently.
+	 *
+	 * Fix: for AE-9, send the MMIO commands here, before the mute.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		ae5_mmio_select_out(codec);
+		if (spec->cur_out_type == HEADPHONE_OUT)
+			ae5_headphone_gain_set(codec,
+					       spec->ae5_headphone_gain_val);
+		else
+			ae5_headphone_gain_set(codec, 2);
+	}
 
 	/* Begin DSP output switch, mute DSP volume. */
 	err = dspio_set_uint_param(codec, 0x96, SPEAKER_TUNING_MUTE, FLOAT_ONE);
@@ -5452,23 +5544,20 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 		}
 
 		/*
-		 * AE-9: the external DAC (CS43198) has no DSP bypass path.
-		 * Always send FLOAT_ONE so the DSP passes signal through,
-		 * regardless of whether PlayEnhancement is enabled.
+		 * AE-9: CORB corb_before_play shows a 2-phase switch:
+		 *   0x80/0x04 = FLOAT_ONE  (establish SBX pipeline)
+		 *   0x80/0x04 = FLOAT_EIGHT (switch to Direct 2ch)
+		 * Without the FLOAT_ONE first, the DSP pipeline may
+		 * never connect input to output buffers.
 		 */
-		if (outfx_set || ca0132_quirk(spec) == QUIRK_AE9)
+		if (ca0132_quirk(spec) == QUIRK_AE9) {
+			dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ONE);
+			err = dspio_set_uint_param(codec, 0x80, 0x04,
+						   FLOAT_EIGHT);
+		} else if (outfx_set)
 			err = dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ONE);
 		else
 			err = dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ZERO);
-
-		/*
-		 * AE-9: Windows Direct Mode CORB trace (corb_dump_direct.txt)
-		 * shows module 0x80 req 0x08 = FLOAT_EIGHT (8.0 = 2.0ch config)
-		 * sent during every playback cycle. Without this, the DSP may
-		 * not route audio to the output path.
-		 */
-		if (ca0132_quirk(spec) == QUIRK_AE9)
-			dspio_set_uint_param(codec, 0x80, 0x08, FLOAT_EIGHT);
 
 		codec_dbg(codec,
 			  "AE-9 select_out: dspio 0x80/0x04 err=%d outfx=%d\n",
@@ -10462,6 +10551,15 @@ handshake_done:
 	dspio_set_uint_param(codec, 0x96, 0x3C, tmp);
 
 	/*
+	 * AE-9: CORB t=10 SCP#3 — req 0x3A = FLOAT_ONE early in boot.
+	 * This unknown param is sent 5+ times by Windows. Pattern:
+	 * FLOAT_ONE before output config, FLOAT_ZERO after routing.
+	 * Possibly "enable audio routing" or "prepare pipeline".
+	 * Our driver never sent this — adding it from CORB evidence.
+	 */
+	dspio_set_uint_param(codec, 0x96, 0x3A, FLOAT_ONE);
+
+	/*
 	 * AE-9 Direct Mode: DSP output enable + unmute.
 	 * From Windows CORB dump (corb_dump_direct.txt, DSP_ChipIO_Architecture.md).
 	 * Without these, the DSP firmware keeps all outputs muted and no
@@ -10491,24 +10589,30 @@ handshake_done:
 	dspio_set_uint_param(codec, 0x96, 0x6A, tmp);  /* direct ch5 mute off */
 	dspio_set_uint_param(codec, 0x96, 0x6C, tmp);  /* direct ch6 mute off */
 	dspio_set_uint_param(codec, 0x96, 0x2A, tmp);  /* unknown mute off */
-	dspio_set_uint_param(codec, 0x80, 0x08, FLOAT_EIGHT);  /* 2.0ch */
-	dspio_set_uint_param(codec, 0x8F, 0x02, tmp);  /* EQ bypass */
+	/*
+	 * AE-9: CORB t=10 shows 0x80/0x04=FLOAT_EIGHT (8.0) = Direct 2ch
+	 * headphone mode. Windows does NOT send 0x80/0x08 at all.
+	 * Also 0x8F/0x01 (NOT 0x02) = EQ bypass disable.
+	 */
+	dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_EIGHT);  /* direct 2ch */
+	dspio_set_uint_param(codec, 0x8F, 0x01, tmp);  /* EQ bypass */
 
 	/*
 	 * AE-9: Initialize DSP volume (module 0x32).
 	 *
-	 * Windows CORB always sends volume L/R/balance before playback.
-	 * Our driver never sends these. The firmware default is unknown
-	 * and may be -infinity (muted). Set to 0 dB (FLOAT_ZERO).
+	 * Windows CORB t=10 decode reveals ctefx-desktop.bin uses
+	 * DIFFERENT request IDs than the generic ctefx.bin firmware:
+	 *   req 0x03 = channel L volume (NOT 0x06)
+	 *   req 0x04 = channel R volume (NOT 0x08)
+	 *   req 0x02 = balance           (NOT 0x04)
 	 *
-	 * From CORB captures:
-	 *   dspio(0x32, 0x06, volume_L)  — left channel volume
-	 *   dspio(0x32, 0x08, volume_R)  — right channel volume
-	 *   dspio(0x32, 0x04, ZERO)      — balance
+	 * Windows sends -42.5 dB (0xC22A0000) as initial mute, then
+	 * unmutes to the user volume later. We start muted and unmute
+	 * to 0 dB (FLOAT_ZERO) after routing is complete.
 	 */
-	dspio_set_uint_param(codec, 0x32, 0x04, tmp);  /* balance = 0 */
-	dspio_set_uint_param(codec, 0x32, 0x06, tmp);  /* volume L = 0 dB */
-	dspio_set_uint_param(codec, 0x32, 0x08, tmp);  /* volume R = 0 dB */
+	dspio_set_uint_param(codec, 0x32, 0x02, tmp);  /* balance = 0 */
+	dspio_set_uint_param(codec, 0x32, 0x03, tmp);  /* volume L = 0 dB */
+	dspio_set_uint_param(codec, 0x32, 0x04, tmp);  /* volume R = 0 dB */
 
 	/*
 	 * AE-9: Windows CORB Phase 15 — repeat param 0x18 and reset 0x1C.
@@ -10517,6 +10621,12 @@ handshake_done:
 	 */
 	chipio_set_control_param(codec, 0x18, 0x14);
 	chipio_set_control_param(codec, 0x1C, 0x00);
+
+	/*
+	 * AE-9: CORB t=10 SCP#14-15 — req 0x3A = FLOAT_ZERO after routing.
+	 * Windows sends this twice then does a GET to confirm DSP processed it.
+	 */
+	dspio_set_uint_param(codec, 0x96, 0x3A, FLOAT_ZERO);
 
 	/* Set WUH source */
 	tmp = FLOAT_TWO;
@@ -10682,21 +10792,28 @@ handshake_done:
 		ca0132_pe_switch_set(codec);
 	} else {
 		/*
-		 * AE-9 Direct Mode: disable all output effects manually.
-		 * Send FLOAT_ZERO for each output effect's on/off param
-		 * (reqs[0]) to put DSP in passthrough mode.
+		 * AE-9 TEST B2+B4: Do NOT disable output effects individually.
+		 *
+		 * Hypothesis: sending FLOAT_ZERO to each effect's on/off
+		 * param BREAKS the DSP pipeline chain (disconnects nodes)
+		 * rather than bypassing them. DMA diagnostic confirms ch1
+		 * and ch2 output counters are frozen — the DSP processes
+		 * audio but produces no output.
+		 *
+		 * Windows corb_before_play shows a 2-phase switch:
+		 *   Phase 1: 0x80/0x04 = FLOAT_ONE  (SBX pipeline active)
+		 *   Phase 2: 0x80/0x04 = FLOAT_EIGHT (switch to Direct)
+		 * We only sent FLOAT_EIGHT. Try the 2-phase approach.
 		 */
-		unsigned int tmp_off = FLOAT_ZERO;
-		int fx_idx;
-
 		codec_info(codec,
-			   "AE-9: effects loaded, disabling for Direct Mode\n");
-		for (fx_idx = 0; fx_idx < OUT_EFFECTS_COUNT; fx_idx++) {
-			dspio_set_uint_param(codec,
-					ca0132_effects[fx_idx].mid,
-					ca0132_effects[fx_idx].reqs[0],
-					tmp_off);
-		}
+			   "AE-9: effects loaded, keeping pipeline active "
+			   "(B2+B4 test)\n");
+
+		/* Phase 1: establish pipeline with FLOAT_ONE */
+		dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_ONE);
+		msleep(50);
+		/* Phase 2: switch to Direct 2ch */
+		dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_EIGHT);
 	}
 
 	/* DIAG: check if effects loop killed stream 0x05 */
