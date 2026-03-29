@@ -4402,6 +4402,37 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 
 		codec_info(codec, "AE-9 pcm_prepare: DONE\n");
 
+		/* DIAG: Read DSP DMA ACTIVE and CHNLSTART registers */
+		{
+			unsigned int dsp_active = 0, dsp_chnlstart = 0;
+			chipio_read(codec, 0x110FFC, &dsp_active);
+			chipio_read(codec, 0x110FF0, &dsp_chnlstart);
+			codec_info(codec,
+				   "AE-9 pcm_prepare: DSP DMA ACTIVE=0x%08x "
+				   "CHNLSTART=0x%08x\n",
+				   dsp_active, dsp_chnlstart);
+
+			/*
+			 * AE-9: Force DSP DMA ACTIVE if firmware hasn't set it.
+			 *
+			 * DSP_ChipIO_Architecture.md section 5.6:
+			 * "ACTIVE=0x00 means the DSP firmware has not activated
+			 *  auto-reset. Forcing ACTIVE=0x07 causes XFRCNT to
+			 *  advance (DMA transfers data)."
+			 *
+			 * Under Windows, the DSP firmware sets ACTIVE itself.
+			 * Under Linux, it never does. Force it to match
+			 * CHNLSTART so DMA channels actually transfer data.
+			 */
+			if (dsp_active == 0 && dsp_chnlstart != 0) {
+				chipio_write(codec, 0x110FFC, dsp_chnlstart);
+				chipio_read(codec, 0x110FFC, &dsp_active);
+				codec_info(codec,
+					   "AE-9 pcm_prepare: forced ACTIVE "
+					   "→ 0x%08x\n", dsp_active);
+			}
+		}
+
 		/*
 		 * Phase 6: Trigger DSP I2S stream RUN.
 		 *
@@ -9396,11 +9427,10 @@ static void ae9_post_dsp_asi_setup(struct hda_codec *codec)
 	ca0113_mmio_gpio_set(codec, 3, true);
 	ca0113_mmio_gpio_set(codec, 1, false);
 	/*
-	 * AE-9: SKIP ae5_post_dsp_param_setup — it sends ASI=0 which
-	 * destroys Direct Mode, 0x724=0x83 (AE-5 specific), and writes
-	 * exram 0xfa92=0x22 (unknown effect). None verified for AE-9.
+	 * AE-9: SKIP ae5_post_dsp_param_setup — it contains AE-5 specific
+	 * commands (verb 0x724, exram 0xFA92, ASI=0) not seen in any
+	 * AE-9 CORB capture. Do not send unverified commands.
 	 */
-	/* ae5_post_dsp_param_setup(codec); */
 
 	mutex_lock(&spec->chipio_mutex);
 
@@ -10441,14 +10471,44 @@ handshake_done:
 	dspio_set_uint_param(codec, 0x96, 0x3E, tmp);  /* speaker mute OFF */
 	dspio_set_uint_param(codec, 0x96, 0x74, tmp);  /* output L enable */
 	dspio_set_uint_param(codec, 0x96, 0x75, tmp);  /* output R enable */
-	dspio_set_uint_param(codec, 0x96, 0x62, tmp);  /* ch1 mute off */
-	dspio_set_uint_param(codec, 0x96, 0x64, tmp);  /* ch2 mute off */
-	dspio_set_uint_param(codec, 0x96, 0x66, tmp);  /* ch3 mute off */
-	dspio_set_uint_param(codec, 0x96, 0x68, tmp);  /* ch4 mute off */
-	dspio_set_uint_param(codec, 0x96, 0x6A, tmp);  /* ch5 mute off */
-	dspio_set_uint_param(codec, 0x96, 0x6C, tmp);  /* ch6 mute off */
+	/*
+	 * AE-9: SBX channel mutes (0x42-0x4C) + Direct channel mutes (0x62-0x6C).
+	 *
+	 * Windows SBX→Direct Mode switch (CORB capture 28 mars) sends BOTH
+	 * sets to FLOAT_ZERO. Without 0x42-0x4C, the SBX pipeline remains
+	 * muted and blocks audio even when Direct Mode is requested.
+	 */
+	dspio_set_uint_param(codec, 0x96, 0x42, tmp);  /* SBX ch1 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x44, tmp);  /* SBX ch2 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x46, tmp);  /* SBX ch3 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x48, tmp);  /* SBX ch4 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x4A, tmp);  /* SBX ch5 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x4C, tmp);  /* SBX ch6 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x62, tmp);  /* direct ch1 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x64, tmp);  /* direct ch2 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x66, tmp);  /* direct ch3 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x68, tmp);  /* direct ch4 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x6A, tmp);  /* direct ch5 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x6C, tmp);  /* direct ch6 mute off */
+	dspio_set_uint_param(codec, 0x96, 0x2A, tmp);  /* unknown mute off */
 	dspio_set_uint_param(codec, 0x80, 0x08, FLOAT_EIGHT);  /* 2.0ch */
-	dspio_set_uint_param(codec, 0x8F, 0x02, tmp);  /* input mode */
+	dspio_set_uint_param(codec, 0x8F, 0x02, tmp);  /* EQ bypass */
+
+	/*
+	 * AE-9: Initialize DSP volume (module 0x32).
+	 *
+	 * Windows CORB always sends volume L/R/balance before playback.
+	 * Our driver never sends these. The firmware default is unknown
+	 * and may be -infinity (muted). Set to 0 dB (FLOAT_ZERO).
+	 *
+	 * From CORB captures:
+	 *   dspio(0x32, 0x06, volume_L)  — left channel volume
+	 *   dspio(0x32, 0x08, volume_R)  — right channel volume
+	 *   dspio(0x32, 0x04, ZERO)      — balance
+	 */
+	dspio_set_uint_param(codec, 0x32, 0x04, tmp);  /* balance = 0 */
+	dspio_set_uint_param(codec, 0x32, 0x06, tmp);  /* volume L = 0 dB */
+	dspio_set_uint_param(codec, 0x32, 0x08, tmp);  /* volume R = 0 dB */
 
 	/*
 	 * AE-9: Windows CORB Phase 15 — repeat param 0x18 and reset 0x1C.
@@ -10598,7 +10658,16 @@ handshake_done:
 			   exram_0c);
 	}
 
-	/* out, in effects + voicefx */
+	/*
+	 * AE-9: Run the effects loop to establish the DSP processing pipeline.
+	 * The ctefx-desktop.bin firmware needs the SCP module configs to set up
+	 * its internal routing and activate DMA (ACTIVE register at 0x110FFC).
+	 * Without these, ACTIVE stays 0 and the DSP never processes audio.
+	 *
+	 * Then disable output effects for Direct Mode by sending FLOAT_ZERO
+	 * to each effect's on/off param. We do NOT call pe_switch_set()
+	 * because it cascades through select_out() which corrupts state.
+	 */
 	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
 	for (idx = 0; idx < num_fx; idx++) {
 		for (i = 0; i <= ca0132_effects[idx].params; i++) {
@@ -10609,14 +10678,37 @@ handshake_done:
 		}
 	}
 
-	/*
-	 * AE-9: The effects loop above sends def_vals (FLOAT_ONE = enabled)
-	 * for all output effects, turning SBX on. But ae9_init_default_state()
-	 * already set PLAY_ENHANCEMENT=0 for Direct Mode. Apply it now so
-	 * the DSP actually disables all output effects and the SBX LED
-	 * turns off on the ACM board.
-	 */
-	ca0132_pe_switch_set(codec);
+	if (ca0132_quirk(spec) != QUIRK_AE9) {
+		ca0132_pe_switch_set(codec);
+	} else {
+		/*
+		 * AE-9 Direct Mode: disable all output effects manually.
+		 * Send FLOAT_ZERO for each output effect's on/off param
+		 * (reqs[0]) to put DSP in passthrough mode.
+		 */
+		unsigned int tmp_off = FLOAT_ZERO;
+		int fx_idx;
+
+		codec_info(codec,
+			   "AE-9: effects loaded, disabling for Direct Mode\n");
+		for (fx_idx = 0; fx_idx < OUT_EFFECTS_COUNT; fx_idx++) {
+			dspio_set_uint_param(codec,
+					ca0132_effects[fx_idx].mid,
+					ca0132_effects[fx_idx].reqs[0],
+					tmp_off);
+		}
+	}
+
+	/* DIAG: check if effects loop killed stream 0x05 */
+	{
+		unsigned int ctrl_05_post = 0;
+		mutex_lock(&spec->chipio_mutex);
+		chipio_get_stream_control(codec, 0x05, &ctrl_05_post);
+		mutex_unlock(&spec->chipio_mutex);
+		codec_info(codec,
+			   "AE-9 DIAG: after effects+pe_switch s05=%u\n",
+			   ctrl_05_post);
+	}
 
 	ca0132_alt_init_speaker_tuning(codec);
 
