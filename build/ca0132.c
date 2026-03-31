@@ -7906,10 +7906,12 @@ static int ca0132_build_controls(struct hda_codec *codec)
 		if (err < 0)
 			return err;
 		/*
-		 * ZxR only has microphone input, there is no front panel
-		 * header on the card, and aux-in is handled by the DBPro board.
+		 * ZxR and AE-9 have no front panel header for input selection.
+		 * ZxR: aux-in handled by DBPro board.
+		 * AE-9: all input is via ACM breakout box (rear mic only).
 		 */
-		if (ca0132_quirk(spec) != QUIRK_ZXR) {
+		if (ca0132_quirk(spec) != QUIRK_ZXR &&
+		    ca0132_quirk(spec) != QUIRK_AE9) {
 			err = ca0132_alt_add_input_enum(codec);
 			if (err < 0)
 				return err;
@@ -9495,8 +9497,13 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 	}
 
 	ae9_post_dsp_pll_setup(codec);
-	/* AE-7 uses 7 here; 0x0f was speculative (Connor, unverified) */
-	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 7);
+	/*
+	 * AE-9: Windows CORB T6[3] and T10[3] show ASI=0x08 at this
+	 * point, then ASI=0x0f later (after CA0113 DAC commands).
+	 * Connor's patch had ASI=7 (copied from AE-7), but 7 never
+	 * appears in any AE-9 CORB capture. Corrected to 8.
+	 */
+	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 8);
 }
 static void ae9_post_dsp_asi_setup(struct hda_codec *codec)
 {
@@ -10590,12 +10597,28 @@ handshake_done:
 	dspio_set_uint_param(codec, 0x96, 0x6C, tmp);  /* direct ch6 mute off */
 	dspio_set_uint_param(codec, 0x96, 0x2A, tmp);  /* unknown mute off */
 	/*
-	 * AE-9: CORB t=10 shows 0x80/0x04=FLOAT_EIGHT (8.0) = Direct 2ch
-	 * headphone mode. Windows does NOT send 0x80/0x08 at all.
+	 * AE-9: corb_windows_boot shows Windows sends req 0x00 and 0x7b to
+	 * module 0x80 (MASTERCONTROL) before req 0x04. These are never sent
+	 * by our driver. req 0x00 = FLOAT_THREE = probable "master enable"
+	 * or "mode 3 = Direct HP". req 0x7b = FLOAT_ZERO at boot.
+	 * CORB t=10 shows 0x80/0x04=FLOAT_EIGHT = Direct 2ch headphone mode.
 	 * Also 0x8F/0x01 (NOT 0x02) = EQ bypass disable.
 	 */
-	dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_EIGHT);  /* direct 2ch */
-	dspio_set_uint_param(codec, 0x8F, 0x01, tmp);  /* EQ bypass */
+	dspio_set_uint_param(codec, 0x80, 0x00, FLOAT_THREE); /* master enable */
+	dspio_set_uint_param(codec, 0x80, 0x7b, tmp);         /* req 0x7b = ZERO */
+	dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_EIGHT); /* direct 2ch */
+	dspio_set_uint_param(codec, 0x8F, 0x01, tmp);         /* EQ bypass */
+	/*
+	 * AE-9: corb_windows_boot shows module 0x95 massively sent at boot
+	 * with reqs 0x00/0x08/0x14/0x26/0x58 = FLOAT_ZERO. Never sent by
+	 * Linux. Also module 0x47 req 0x00 = FLOAT_ZERO.
+	 */
+	dspio_set_uint_param(codec, 0x95, 0x00, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x08, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x14, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x26, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x58, tmp);
+	dspio_set_uint_param(codec, 0x47, 0x00, tmp);
 
 	/*
 	 * AE-9: Initialize DSP volume (module 0x32).
@@ -11438,11 +11461,13 @@ static void ca0132_init_chip(struct hda_codec *codec)
 	}
 
 	/*
-	 * The ZxR doesn't have a front panel header, and it's line-in is on
-	 * the daughter board. So, there is no input enum control, and we need
-	 * to make sure that spec->in_enum_val is set properly.
+	 * The ZxR and AE-9 have no front panel input selection.
+	 * ZxR: daughter board handles aux-in.
+	 * AE-9: ACM breakout box, rear mic only.
+	 * Force in_enum_val so the input path is configured correctly.
 	 */
-	if (ca0132_quirk(spec) == QUIRK_ZXR)
+	if (ca0132_quirk(spec) == QUIRK_ZXR ||
+	    ca0132_quirk(spec) == QUIRK_AE9)
 		spec->in_enum_val = REAR_MIC;
 
 #ifdef ENABLE_TUNING_CONTROLS
@@ -11982,8 +12007,8 @@ static void ca0132_mmio_init_ae9(struct hda_codec *codec)
 
 	/*
 	 * AE-9 HDA controller basic init (indices 0-15 from AE-5 table).
-	 * The CA0113 init happens later in ca0132_ca0113_init_ae9(), called
-	 * AFTER ae5_register_set() + init_params/flags/base_init_verbs.
+	 * GPIO5, VIP_SOURCE, PORTA_GAIN and CODEC_RESET are now sent
+	 * earlier in ae5_register_set() (Connor's patch 0005 position).
 	 */
 	writel(0x00000001, mem + 0x400);
 	readl(mem + 0x400);
@@ -12060,46 +12085,17 @@ static void ca0132_mmio_init_ae9(struct hda_codec *codec)
 }
 
 /*
- * AE-9 CA0113 command interface init.
+ * ca0132_ca0113_init_ae9() was here but has been removed.
  *
- * Call sequence in ca0132_init():
- *   ca0132_mmio_init_ae9()     → HDA basic + 0x20c=0x800000
- *   ae5_register_set()         → PLL/DMA/clock + 0x20c=0x800001
- *   ca0132_init_params()       → ~85 HDA verbs (chipio params)
- *   ca0132_init_flags()        → control flags
- *   snd_hda_sequence_write()   → base init verbs
- *   >>> ca0132_ca0113_init_ae9() <<<  — HERE, after all verbs
+ * Items 1-5 (GPIO5, GPIO0, VIP_SOURCE, PORTA_GAIN) and items 8, 10
+ * (GPIO2, GPIO3) plus CODEC_RESET x2 are now in ae5_register_set()
+ * at Connor's original patch 0005 position — BEFORE init_params.
  *
- * The MMIO capture shows Windows sends ~85 CORB verbs between
- * writing 0x800001 and 0x800003 to 0x20c. These verbs configure
- * the 8051 before the CA0113 handshake. Without them, the CA0113
- * stays dead (0x208=0xffffffff).
- *
- * Decoded from VFIO MMIO capture of Windows boot (2.2M lines).
- * Fernando RE confirms 200ms critical delay.
+ * The previous assumption that "CA0113 is not alive so gpio_set fails"
+ * was wrong: ca0113_mmio_gpio_set uses direct writew to BAR2+0x320,
+ * and chipio_set_control_param uses HDA verbs. Neither needs the
+ * CA0113 command engine (0x20c/0x860 protocol).
  */
-static void ca0132_ca0113_init_ae9(struct hda_codec *codec)
-{
-	struct ca0132_spec *spec = codec->spec;
-
-	/*
-	 * AE-9: Pre-DSP GPIO setup only. The CA0113 command interface
-	 * is NOT alive yet at this point (0x208=0xffffffff). It only
-	 * responds after the DSP firmware is downloaded and all init
-	 * verbs have been sent. The full CA0113 handshake happens in
-	 * ae9_post_dsp_mmio_commands() after the DSP download.
-	 *
-	 * GPIO 5 = DAC board power — must be set here so D2 (ACM codec)
-	 * is alive when the HDA controller enumerates codecs.
-	 * chipio_set_control_param uses HDA verbs (not CA0113 MMIO),
-	 * so these work even with CA0113 dead.
-	 */
-	ca0113_mmio_gpio_set(codec, 5, true);
-	ca0113_mmio_gpio_set(codec, 0, false);
-	chipio_set_control_param(codec, CONTROL_PARAM_VIP_SOURCE, 0);
-	chipio_set_control_param(codec, CONTROL_PARAM_PORTA_160OHM_GAIN, 6);
-	ca0113_mmio_gpio_set(codec, 0, true);
-}
 
 static void ca0132_mmio_init(struct hda_codec *codec)
 {
@@ -12208,17 +12204,55 @@ static void ae5_register_set(struct hda_codec *codec)
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_AE9:
 		/*
-		 * AE-9: Skip CA0113 commands and codec reset here.
-		 * CA0113 is not alive yet (0x208=0xffffffff), so gpio_set
-		 * and command_set calls are silently lost. These are deferred
-		 * to ca0132_ca0113_init_ae9() which runs after the ~85 HDA
-		 * verbs from init_params/flags have been sent.
-		 *
-		 * Only set clock and chipio regs that don't need CA0113.
+		 * AE-9: Restore Connor's patch 0005 sequence.
+		 * gpio_set = direct writew to BAR2+0x320, works always.
+		 * chipio_set_control_param = HDA verb, works always.
+		 * CA0113 command_set = needs engine alive, skip (done later
+		 * in ae9_post_dsp_asi_setup after handshake).
+		 * CODEC_RESET = HDA verb, works always. Resets the 8051
+		 * AFTER PLL/clock are configured so it re-inits with
+		 * correct timings.
 		 */
+		codec_info(codec,
+			   "AE-9: ae5_register_set: GPIO+VIP+RESET sequence\n");
+
+		/* Items 1-5: GPIO and chipio params (all work without CA0113) */
+		ca0113_mmio_gpio_set(codec, 5, true);   /* DAC power ON */
+		ca0113_mmio_gpio_set(codec, 0, false);  /* GPIO0 OFF */
+		chipio_set_control_param(codec, CONTROL_PARAM_VIP_SOURCE, 0);
+		chipio_set_control_param(codec, CONTROL_PARAM_PORTA_160OHM_GAIN, 6);
+		ca0113_mmio_gpio_set(codec, 0, true);   /* GPIO0 ON */
+
+		/*
+		 * Items 6, 7, 9: CA0113 commands SKIPPED here.
+		 * ca0113_mmio_command_set uses the 0x20c/0x860 protocol
+		 * which needs the CA0113 engine alive. At this point
+		 * 0x208=0xffffffff — engine is dead. These are sent
+		 * later in ae9_post_dsp_asi_setup() after the handshake.
+		 */
+
+		/* Items 8, 10: GPIO writes (direct MMIO, work always) */
+		ca0113_mmio_gpio_set(codec, 2, false);  /* GPIO2 OFF */
+		ca0113_mmio_gpio_set(codec, 3, true);   /* GPIO3 ON */
+
+		/* Item 11 preamble: same as ca0132_init_chip pattern */
 		writel(0x00880480, spec->mem_base + 0x01c);
 		chipio_write(codec, 0x18b0a4, 0x000000c2);
 		chipio_set_control_flag(codec, CONTROL_FLAG_IDLE_ENABLE, 0);
+
+		/* Item 11: CODEC_RESET x2 AFTER PLL/clock setup */
+		codec_info(codec,
+			   "AE-9: ae5_register_set: CODEC_RESET x2 "
+			   "(post-PLL, 0x20c=0x%08x)\n",
+			   readl(spec->mem_base + 0x20c));
+		snd_hda_codec_write(codec, codec->core.afg, 0,
+				    AC_VERB_SET_CODEC_RESET, 0);
+		snd_hda_codec_write(codec, codec->core.afg, 0,
+				    AC_VERB_SET_CODEC_RESET, 0);
+		codec_info(codec,
+			   "AE-9: ae5_register_set: CODEC_RESET done, "
+			   "0x20c=0x%08x\n",
+			   readl(spec->mem_base + 0x20c));
 		break;
 	case QUIRK_AE7:
 		ca0113_mmio_command_set_type2(codec, 0x48, 0x07, 0x83);
@@ -12278,9 +12312,11 @@ static void ca0132_alt_init(struct hda_codec *codec)
 		break;
 	case QUIRK_AE9:
 		/*
-		 * AE-9 init differs from AE-7: 0x18b030=0x27 (not 0x20),
-		 * and gpio_set(3, false) instead of mmio_command_set.
-		 * Source: patch 0006 (Connor McAdams).
+		 * AE-9 alt_init. Values 0x18b008=0xf0 and 0x18b030=0x27
+		 * are the factory defaults set by the 8051 at boot (verified
+		 * by diagnostic read). These writes are redundant but kept
+		 * for consistency with AE-7 code path.
+		 * Connor had no AE-9 hardware; values were correct by luck.
 		 */
 		ca0132_gpio_init(codec);
 		chipio_8051_write_pll_pmu(codec, 0x49, 0x88);
@@ -12381,17 +12417,10 @@ static int ca0132_init(struct hda_codec *codec)
 		codec_info(codec, "AE-9 DIAG: after base_init_verbs 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	/*
-	 * AE-9: Complete the CA0113 command interface init.
-	 * ae5_register_set() wrote 0x20c=0x800001. The ~85 HDA verbs
-	 * sent by init_params/flags/base_init_verbs configure the 8051
-	 * and are required before the CA0113 handshake (0x800003 + 0xffff).
-	 * MMIO capture shows Windows sends these verbs in exactly this
-	 * position — between 0x800001 and 0x800003.
+	 * AE-9: ca0132_ca0113_init_ae9() removed. GPIO5, VIP_SOURCE,
+	 * PORTA_GAIN, and CODEC_RESET are now in ae5_register_set()
+	 * at Connor's original position (patch 0005).
 	 */
-	if (ca0132_quirk(spec) == QUIRK_AE9)
-		ca0132_ca0113_init_ae9(codec);
-	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after ca0113_init 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	if (ca0132_use_alt_functions(spec))
 		ca0132_alt_init(codec);
