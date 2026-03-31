@@ -5596,6 +5596,30 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 	else
 		err = ca0132_alt_surround_set_bass_redirection(codec, 0);
 
+	/*
+	 * AE-9: corb_before_play_26mars shows Windows sends these
+	 * module 0x96 reqs (0x00/0x04/0x08/0x0e = ZERO) and module 0x95
+	 * EQ crossover frequencies before every playback. Never sent by us.
+	 */
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		static const unsigned int crossover_freqs[] = {
+			0x43B10000,  /* 354 Hz  (req 0x4e) */
+			0x44310000,  /* 708 Hz  (req 0x50) */
+			0x44B10000,  /* 1416 Hz (req 0x52) */
+			0x45310000,  /* 2832 Hz (req 0x54) */
+			0x44FA0000,  /* 2000 Hz (req 0x56) */
+		};
+		dspio_set_uint_param(codec, 0x96, 0x00, FLOAT_ZERO);
+		dspio_set_uint_param(codec, 0x96, 0x04, FLOAT_ZERO);
+		dspio_set_uint_param(codec, 0x96, 0x08, FLOAT_ZERO);
+		dspio_set_uint_param(codec, 0x96, 0x0e, FLOAT_ZERO);
+		dspio_set_uint_param(codec, 0x95, 0x4e, crossover_freqs[0]);
+		dspio_set_uint_param(codec, 0x95, 0x50, crossover_freqs[1]);
+		dspio_set_uint_param(codec, 0x95, 0x52, crossover_freqs[2]);
+		dspio_set_uint_param(codec, 0x95, 0x54, crossover_freqs[3]);
+		dspio_set_uint_param(codec, 0x95, 0x56, crossover_freqs[4]);
+	}
+
 	/* Unmute DSP now that we're done with output selection. */
 	codec_dbg(codec, "AE-9 select_out: about to unmute\n");
 	err = dspio_set_uint_param(codec, 0x96,
@@ -10608,17 +10632,6 @@ handshake_done:
 	dspio_set_uint_param(codec, 0x80, 0x7b, tmp);         /* req 0x7b = ZERO */
 	dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_EIGHT); /* direct 2ch */
 	dspio_set_uint_param(codec, 0x8F, 0x01, tmp);         /* EQ bypass */
-	/*
-	 * AE-9: corb_windows_boot shows module 0x95 massively sent at boot
-	 * with reqs 0x00/0x08/0x14/0x26/0x58 = FLOAT_ZERO. Never sent by
-	 * Linux. Also module 0x47 req 0x00 = FLOAT_ZERO.
-	 */
-	dspio_set_uint_param(codec, 0x95, 0x00, tmp);
-	dspio_set_uint_param(codec, 0x95, 0x08, tmp);
-	dspio_set_uint_param(codec, 0x95, 0x14, tmp);
-	dspio_set_uint_param(codec, 0x95, 0x26, tmp);
-	dspio_set_uint_param(codec, 0x95, 0x58, tmp);
-	dspio_set_uint_param(codec, 0x47, 0x00, tmp);
 
 	/*
 	 * AE-9: Initialize DSP volume (module 0x32).
