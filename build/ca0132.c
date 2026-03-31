@@ -4501,13 +4501,21 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			chipio_read(codec, 0x110F28, &xfr2b);
 			chipio_read(codec, 0x110FFC, &active2);
 
+			{ unsigned int ch_stat = 0, ach0 = 0, ach1 = 0, ach2 = 0;
+			chipio_read(codec, 0x110FF4, &ch_stat);
+			chipio_read(codec, 0x110FC0, &ach0);
+			chipio_read(codec, 0x110FC4, &ach1);
+			chipio_read(codec, 0x110FC8, &ach2);
 			codec_info(codec,
 				   "AE-9 DIAG DMA: ch0(HDA→DSP) %08x→%08x "
 				   "ch1(DSP→DAC) %08x→%08x "
 				   "ch2(DSP→I2S) %08x→%08x "
-				   "DBGCTL=0x%x ACTIVE=0x%x\n",
+				   "DBGCTL=0x%x ACTIVE=0x%x "
+				   "CH_STAT=0x%x AUDCHSEL=%x/%x/%x\n",
 				   xfr0a, xfr0b, xfr1a, xfr1b,
-				   xfr2a, xfr2b, dbgcntl, active2);
+				   xfr2a, xfr2b, dbgcntl, active2,
+				   ch_stat, ach0, ach1, ach2);
+			}
 		}
 	}
 
@@ -10632,6 +10640,13 @@ handshake_done:
 	dspio_set_uint_param(codec, 0x80, 0x7b, tmp);         /* req 0x7b = ZERO */
 	dspio_set_uint_param(codec, 0x80, 0x04, FLOAT_EIGHT); /* direct 2ch */
 	dspio_set_uint_param(codec, 0x8F, 0x01, tmp);         /* EQ bypass */
+	/* AE-9: module 0x95 boot init (corb_windows_boot) */
+	dspio_set_uint_param(codec, 0x95, 0x00, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x08, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x14, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x26, tmp);
+	dspio_set_uint_param(codec, 0x95, 0x58, tmp);
+	dspio_set_uint_param(codec, 0x47, 0x00, tmp);
 
 	/*
 	 * AE-9: Initialize DSP volume (module 0x32).
