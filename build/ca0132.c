@@ -12995,35 +12995,26 @@ static int ca0132_codec_probe(struct hda_codec *codec, const struct hda_device_i
 
 	/*
 	 * AE-9 dual-codec: D2 (addr=2, SSID 0x11020072) is the ACM board.
-	 * Claim it with a minimal spec (no DSP, no BAR2, no mixers) so that
-	 * snd_hda_codec_generic cannot claim it and spam the bus.
+	 *
+	 * Under Windows, D2 is driven by MSHDAudio (Microsoft HDA generic
+	 * driver), NOT by the Creative SoundCore3D driver. D2 has its own
+	 * NID 0x0F (HP Out) corresponding to the ACM headphone jack.
+	 *
+	 * Return -ENODEV so that snd-hda-codec-generic can claim D2 and
+	 * expose a PCM device for it, matching the Windows behaviour.
 	 *
 	 * For non-AE-9 cards, skip D2 as before (they have no D2).
 	 */
 	if (codec->addr >= 2) {
-		struct ca0132_spec *spec_d2;
-
-		/* AE-9 check: PCI subsystem device 0x0071 */
 		if (codec->bus->pci &&
 		    codec->bus->pci->subsystem_device == 0x0071) {
 			codec_info(codec,
-				"AE-9: claiming D2 for ACM communication\n");
-
-			spec_d2 = kzalloc(sizeof(*spec_d2), GFP_KERNEL);
-			if (!spec_d2)
-				return -ENOMEM;
-
-			codec->spec = spec_d2;
-			spec_d2->codec = codec;
-			spec_d2->is_d2_acm_only = true;
-
-			snd_hda_codec_set_name(codec, "AE-9 ACM Board");
-			return 0;
+				"AE-9: D2 released to snd-hda-codec-generic\n");
+		} else {
+			codec_dbg(codec,
+				"ca0132: skipping secondary codec at addr %d\n",
+				codec->addr);
 		}
-
-		codec_dbg(codec,
-			"ca0132: skipping secondary codec at addr %d\n",
-			codec->addr);
 		return -ENODEV;
 	}
 	codec_dbg(codec, "patch_ca0132\n");
