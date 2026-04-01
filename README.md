@@ -24,11 +24,11 @@ board stays powered off and the DAC is inaccessible.
 |-----------|---------|
 | Main codec | CA0132 D1 — DSP + HDA I/O (addr=1, SSID 1102:0071) |
 | Second codec | CA0132 D2 — SPDIF I/O only (addr=2, SSID 1102:0072) |
-| DAC (Front/HP) | **ESS ES9038Q2M** 2ch (CA0113 group 0x48) |
-| DAC (Surround) | **ESS SABRE9006A** 8ch (CA0113 group 0x49) |
-| ACM box | XAMP headphone amp, OLED display, volume knob, XLR mic |
+| DAC (Front/HP) | **ESS ES9038Q2M** 2ch (CA0113 group 0x48, on PCIe card) |
+| DAC (Surround) | **ESS SABRE9006A** 8ch (CA0113 group 0x49, on PCIe card) |
+| ACM box | **No DAC** — XAMP headphone amp, OLED display, volume knob, XLR mic preamp |
 | I2C controller | CA0113 MMIO at BAR2 + 0xC00 |
-| HDMI cable | Proprietary: 5V + I2S + I2C + HPD (not standard HDMI A/V) |
+| HDMI cable | Proprietary: **analog audio** + I2C + 5V + HPD (NOT digital I2S) |
 | DSP firmware | `ctefx-desktop.bin` (655,856 bytes, 7 MXFL sections) |
 
 ### Dual-codec architecture
@@ -37,7 +37,7 @@ The AE-9 is unique in the CA0132 family: it has **two CA0132 chips** on the PCIe
 
 - **D1 (addr=1):** Main DSP — runs firmware, effects (SBX/EQ/CrystalVoice), all audio routing.
   Manages both the ES9038Q2M (Front/HP) and SABRE9006A (Surround) via CA0113.
-  Headphone output goes through D1 → CA0113 → I2S → HDMI cable → ACM → XAMP.
+  Headphone output goes through D1 → CA0113 → I2S → ES9038Q2M (on PCIe card) → analog → HDMI cable → ACM XAMP.
 - **D2 (addr=2):** SPDIF optical I/O only. Idle unless EQ or DTS Connect is active.
   Windows uses Microsoft's generic HDA driver (MSHDAudio) for D2, not Creative's SoundCore3D.
 
@@ -169,8 +169,8 @@ L'AE-9 a **deux puces CA0132** sur la carte PCIe :
 - **D1** (addr=1) : DSP principal — firmware, effets, routing audio, contrôle des DACs
 - **D2** (addr=2) : SPDIF optique uniquement — inactif sauf EQ/DTS Connect
 
-Trois DACs : ES9038Q2M (Front/casque, group 0x48), SABRE9006A (surround, group 0x49),
-et potentiellement un ES9038Q2M dans l'ACM pour le casque.
+Trois DACs sur la carte PCIe : ES9038Q2M (Front/casque, group 0x48) et SABRE9006A (surround, group 0x49).
+L'ACM ne contient **aucun DAC** — c'est un étage purement analogique (ampli XAMP + préampli micro + alimentation).
 
 ### État actuel
 
