@@ -132,7 +132,6 @@ sudo dmesg | grep "DIAG DMA" | tail -3
 - **SCP GET broken** on all CA0132 cards under Linux (unsolicited response IRQ)
 - Volume knob does not control system volume
 - Microphone input not exposed
-- ~12 second delay before ACM initializes after boot
 
 ### Project structure
 
