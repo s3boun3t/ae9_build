@@ -167,8 +167,7 @@ ACM reste éteinte et le DAC est inaccessible.
 L'AE-9 a **deux puces CA0132** sur la carte PCIe :
 - **D1** (addr=1) : DSP principal — firmware, effets, routing audio, contrôle des DACs
 - **D2** (addr=2) : SPDIF optique uniquement — inactif sauf EQ/DTS Connect
-
-Trois DACs sur la carte PCIe : ES9038Q2M (Front/casque, group 0x48) et SABRE9006A (surround, group 0x49).
+2 DACs sur la carte PCIe : ES9038Q2M (Front/casque, group 0x48) et SABRE9006A (surround, group 0x49).
 L'ACM ne contient **aucun DAC** — c'est un étage purement analogique (ampli XAMP + préampli micro + alimentation).
 
 ### État actuel
