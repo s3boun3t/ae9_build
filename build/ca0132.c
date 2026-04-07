@@ -1679,7 +1679,7 @@ static int chipio_send(struct hda_codec *codec,
 		msleep(20);
 	} while (time_before(jiffies, timeout));
 
-	codec_info(codec, "AE-9 DEBUG: chipio_send TIMEOUT reg=0x%x data=0x%x\n",
+	codec_dbg(codec, "AE-9 DEBUG: chipio_send TIMEOUT reg=0x%x data=0x%x\n",
 		   reg, data);
 	return -EIO;
 }
@@ -1923,6 +1923,10 @@ static void chipio_set_control_param(struct hda_codec *codec,
 			snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
 					    VENDOR_CHIPIO_PARAM_EX_VALUE_SET,
 					    param_val);
+		} else {
+			codec_warn(codec,
+				   "PARAM_EX DROPPED id=0x%x val=0x%x\n",
+				   param_id, param_val);
 		}
 		mutex_unlock(&spec->chipio_mutex);
 	}
@@ -1948,6 +1952,10 @@ static void chipio_set_control_param_no_mutex(struct hda_codec *codec,
 			snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
 					    VENDOR_CHIPIO_PARAM_EX_VALUE_SET,
 					    param_val);
+		} else {
+			codec_warn(codec,
+				   "PARAM_EX DROPPED (no_mutex) id=0x%x val=0x%x\n",
+				   param_id, param_val);
 		}
 	}
 }
@@ -1988,8 +1996,8 @@ static void chipio_set_stream_control(struct hda_codec *codec,
 			CONTROL_PARAM_STREAM_ID, streamid);
 	chipio_set_control_param_no_mutex(codec,
 			CONTROL_PARAM_STREAM_CONTROL, enable);
-	codec_dbg(codec, "AE-9: stream_control stream=0x%02x enable=%d\n",
-		   streamid, enable);
+	/* codec_dbg(codec, "AE-9: stream_control stream=0x%02x enable=%d\n",
+		   streamid, enable); */
 }
 
 /*
@@ -3755,7 +3763,7 @@ static bool dspload_wait_loaded(struct hda_codec *codec)
 
 	do {
 		if (dspload_is_loaded(codec)) {
-			codec_info(codec, "ca0132 DSP downloaded and running\n");
+			codec_dbg(codec, "ca0132 DSP downloaded and running\n");
 			return true;
 		}
 		msleep(20);
@@ -3914,14 +3922,14 @@ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
 
 	/* Wait for response ready (bit 23 = 1) */
 	if (ca0113_mmio_wait_response(spec) < 0) {
-		codec_info(codec,
+		codec_dbg(codec,
 			   "CA0113 type1: 0x%02x/0x%02x=0x%02x TIMEOUT "
 			   "(0x20c=0x%08x 0x860=%d)\n",
 			   group, target, value,
 			   readl(spec->mem_base + 0x20c),
 			   readl(spec->mem_base + 0x860));
 	} else {
-		codec_info(codec,
+		codec_dbg(codec,
 			  "CA0113 type1: 0x%02x/0x%02x=0x%02x OK "
 			  "(0x20c=0x%08x 0x860=%d)\n",
 			  group, target, value,
@@ -3979,14 +3987,14 @@ static void ca0113_mmio_command_set_type2(struct hda_codec *codec,
 
 	/* Wait for response */
 	if (ca0113_mmio_wait_response(spec) < 0) {
-		codec_info(codec,
+		codec_dbg(codec,
 			   "CA0113 type2: 0x%02x/0x%02x=0x%02x TIMEOUT "
 			   "(0x20c=0x%08x 0x860=%d)\n",
 			   group, target, value,
 			   readl(spec->mem_base + 0x20c),
 			   readl(spec->mem_base + 0x860));
 	} else {
-		codec_info(codec,
+		codec_dbg(codec,
 			  "CA0113 type2: 0x%02x/0x%02x=0x%02x OK "
 			  "(0x20c=0x%08x 0x860=%d)\n",
 			  group, target, value,
@@ -4420,17 +4428,19 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 		}
 
 		/*
-		 * Phase 7: Force DSP DMA ACTIVE if firmware hasn't set it.
-		 * Under Windows the DSP firmware sets ACTIVE itself.
-		 * Under Linux it may not — force it to match CHNLSTART.
+		 * DSP DMA ACTIVE register — read-only diagnostic.
+		 * Under Windows, the firmware sets ACTIVE=0x07 itself
+		 * when the pipeline is ready. Forcing it from the CPU
+		 * does not help — the DSP must do it internally.
 		 */
 		{
 			unsigned int dsp_active = 0, dsp_chnlstart = 0;
 
 			chipio_read(codec, 0x110FFC, &dsp_active);
 			chipio_read(codec, 0x110FF0, &dsp_chnlstart);
-			if (dsp_active == 0 && dsp_chnlstart != 0)
-				chipio_write(codec, 0x110FFC, dsp_chnlstart);
+			codec_dbg(codec,
+				  "AE-9 pcm_prepare: ACTIVE=0x%x CHNLSTART=0x%x\n",
+				  dsp_active, dsp_chnlstart);
 		}
 
 		{
@@ -4439,7 +4449,7 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 			chipio_read(codec, 0x110F08, &ch0);
 			chipio_read(codec, 0x110F18, &ch1);
 			chipio_read(codec, 0x110F28, &ch2);
-			codec_info(codec,
+			codec_dbg(codec,
 				   "AE-9 pcm_prepare: done ch0=%08x ch1=%08x ch2=%08x\n",
 				   ch0, ch1, ch2);
 		}
@@ -5588,7 +5598,7 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 	codec_dbg(codec, "AE-9 select_out: about to unmute\n");
 	err = dspio_set_uint_param(codec, 0x96,
 			SPEAKER_TUNING_MUTE, FLOAT_ZERO);
-	codec_info(codec, "AE-9 select_out: unmute err=%d\n", err);
+	codec_dbg(codec, "AE-9 select_out: unmute err=%d\n", err);
 	if (err < 0)
 		goto exit;
 
@@ -5604,7 +5614,7 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 		dspio_write(codec, 0x00000200);
 	}
 
-	codec_info(codec, "AE-9 select_out: unmute OK\n");
+	codec_dbg(codec, "AE-9 select_out: unmute OK\n");
 
 	if (spec->cur_out_type == SPEAKER_OUT) {
 		err = ca0132_alt_set_full_range_speaker(codec);
@@ -8138,7 +8148,7 @@ static void ae9_ca0113_deferred_work(struct work_struct *work)
 	if (!mem || spec->ca0113_ready)
 		return;
 
-	codec_info(codec, "AE-9: deferred CA0113 handshake starting\n");
+	codec_dbg(codec, "AE-9: deferred CA0113 handshake starting\n");
 
 	/* Handshake: 0x800003 to 0x20c, then 0xffff to 0x208 */
 	writel(0x00800003, mem + 0x20c);
@@ -8156,7 +8166,7 @@ static void ae9_ca0113_deferred_work(struct work_struct *work)
 		if (val != 0xffffffff)
 			break;
 	}
-	codec_info(codec,
+	codec_dbg(codec,
 		   "AE-9: CA0113 handshake: 0x208=0x%08x (poll %d)\n",
 		   val, i);
 
@@ -8214,10 +8224,10 @@ static void ae9_ca0113_deferred_work(struct work_struct *work)
 	 * ca0132_init(). The CA0113 is alive, so all ca0113_mmio_command_set
 	 * calls will work. This sets up streams, effects, ACM, GPIO, etc.
 	 */
-	codec_info(codec, "AE-9: running deferred ae9_setup_defaults\n");
+	codec_dbg(codec, "AE-9: running deferred ae9_setup_defaults\n");
 	ae9_setup_defaults(codec);
 
-	codec_info(codec,
+	codec_dbg(codec,
 		   "AE-9: CA0113 alive, setup complete, SBX off\n");
 }
 
@@ -8856,7 +8866,7 @@ static void chipio_remap_stream(struct hda_codec *codec,
 	}
 
 	if (stream_offset == 0xff) {
-		codec_info(codec, "%s: Stream 0x%02x ports aren't allocated, remap failed!\n",
+		codec_dbg(codec, "%s: Stream 0x%02x ports aren't allocated, remap failed!\n",
 				__func__, remap_data->stream_id);
 		return;
 	}
@@ -9407,13 +9417,13 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 		ca0113_mmio_command_set(codec, 0x48, 0x0f, 0x31);
 
 	if (start_stream) {
-		/* AE-9: DestConnID = 0xd1 (I2S→ACM path) */
-		chipio_set_stream_source_dest(codec, 0x18, 0x09, 0xd1);
+		/* AE-9: DestConnID = 0xd0 (Connor/AE-5 value) */
+		chipio_set_stream_source_dest(codec, 0x18, 0x09, 0xd0);
 	} else {
 		ca0113_mmio_command_set(codec, 0x48, 0x10, 0x31);
 	}
 
-	chipio_set_conn_rate_no_mutex(codec, 0xd1, SR_96_000);
+	chipio_set_conn_rate_no_mutex(codec, 0xd0, SR_96_000);
 	chipio_set_stream_channels(codec, 0x18, 6);
 
 	if (start_stream) {
@@ -9447,14 +9457,12 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 		ca0113_mmio_command_set_type2(codec, 0x48, 0x0e, 0x00);
 		ca0113_mmio_command_set(codec, 0x48, 0x0e, 0x8a);
 		/*
-		 * AE-9: ChipIO memory values differ from AE-5/AE-7:
-		 *   0x189000-008: 0x0001f100 (bit 0 clear, unlike AE-5's 0x0001f101)
-		 *   0x189024:     0x00008005 (differs from AE-5's 0x00014004)
+		 * AE-9: Use Connor/AE-5 HCI values.
 		 */
-		chipio_write_no_mutex(codec, 0x189000, 0x0001f100);
-		chipio_write_no_mutex(codec, 0x189004, 0x0001f100);
-		chipio_write_no_mutex(codec, 0x189008, 0x0001f100);
-		chipio_write_no_mutex(codec, 0x189024, 0x00008005);
+		chipio_write_no_mutex(codec, 0x189000, 0x0001f101);
+		chipio_write_no_mutex(codec, 0x189004, 0x0001f101);
+		chipio_write_no_mutex(codec, 0x189008, 0x0001f101);
+		chipio_write_no_mutex(codec, 0x189024, 0x00014004);
 		chipio_write_no_mutex(codec, 0x189028, 0x0002000f);
 		/*
 		 * AE-9: params 0x7D/0x90/0x91/0xFC confirmed from Windows CORB.
@@ -9468,13 +9476,8 @@ static void ae9_post_dsp_stream_setup(struct hda_codec *codec,
 	}
 
 	ae9_post_dsp_pll_setup(codec);
-	/*
-	 * AE-9: Windows CORB T6[3] and T10[3] show ASI=0x08 at this
-	 * point, then ASI=0x0f later (after CA0113 DAC commands).
-	 * Connor's patch had ASI=7 (copied from AE-7), but 7 never
-	 * appears in any AE-9 CORB capture. Corrected to 8.
-	 */
-	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 8);
+	/* AE-9: Connor uses ASI=0x0f (Direct Mode final value) */
+	chipio_set_control_param_no_mutex(codec, CONTROL_PARAM_ASI, 0x0f);
 }
 static void ae9_post_dsp_asi_setup(struct hda_codec *codec)
 {
@@ -9494,20 +9497,16 @@ static void ae9_post_dsp_asi_setup(struct hda_codec *codec)
 	ca0113_mmio_gpio_set(codec, 3, true);
 	ca0113_mmio_gpio_set(codec, 1, false);
 	/*
-	 * AE-9: SKIP ae5_post_dsp_param_setup — it contains AE-5 specific
-	 * commands (verb 0x724, exram 0xFA92, ASI=0) not seen in any
-	 * AE-9 CORB capture. Do not send unverified commands.
+	 * AE-9: Call ae5_post_dsp_param_setup — Connor's patch 0007
+	 * includes this. Sends verb 0x724=0x83 + exram 0xfa92=0x22.
 	 */
+	ae5_post_dsp_param_setup(codec);
 
 	mutex_lock(&spec->chipio_mutex);
 
 	ae9_post_dsp_pll_setup(codec);
-    snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0, 0x725, 0x81);
+	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0, 0x725, 0x81);
 	chipio_set_conn_rate_no_mutex(codec, 0x70, SR_96_000);
-	chipio_set_conn_rate_no_mutex(codec, 0x48, SR_96_000);
-	chipio_set_stream_source_dest(codec, 0x14, 0x48, 0x70);
-	chipio_set_stream_channels(codec, 0x14, 2);
-	chipio_set_stream_control(codec, 0x14, 1);
 	chipio_set_stream_channels(codec, 0x0c, 6);
 	chipio_set_stream_control(codec, 0x0c, 1);
 	ae9_post_dsp_stream_setup(codec, true);
@@ -9822,7 +9821,7 @@ static int ae9_acm_bus_init(struct hda_codec *c)
 	if (!base)
 		return -ENXIO;
 
-	codec_info(c, "AE-9: ACM bus init (Phase 1: no readl on 0xC00-0xC7F)\n");
+	codec_dbg(c, "AE-9: ACM bus init (Phase 1: no readl on 0xC00-0xC7F)\n");
 
 	/*
 	 * Full bus init — writes only, no reads on 0xC00-0xC7F.
@@ -9866,7 +9865,7 @@ static int ae9_acm_bus_init(struct hda_codec *c)
 	writel(0x00, base + 0xC00);
 	writel(0xf7, base + 0xC00);
 
-	codec_info(c, "AE-9: bus init complete (writes only)\n");
+	codec_dbg(c, "AE-9: bus init complete (writes only)\n");
 
 	return 0;
 }
@@ -9981,7 +9980,7 @@ static void ae9_acm_init(struct hda_codec *c)
 	/* TX#29: unmute final */
 	static const u8 tx_unmute2[] = {0x22,0x02,0x01,0x01};
 
-	codec_info(c, "AE-9 ACM: Phase 1 handshake + key C14=0x%02x\n",
+	codec_dbg(c, "AE-9 ACM: Phase 1 handshake + key C14=0x%02x\n",
 		   readl(s->mem_base + 0xC14) & 0xff);
 	ae9_i2c_send(c, "reset",   tx_reset,   ARRAY_SIZE(tx_reset));
 	ae9_i2c_send(c, "hs_fwd",  tx_hs_fwd,  ARRAY_SIZE(tx_hs_fwd));
@@ -9991,7 +9990,7 @@ static void ae9_acm_init(struct hda_codec *c)
 	ae9_i2c_send(c, "key",     tx_key,     ARRAY_SIZE(tx_key));
 	usleep_range(5000, 10000);
 
-	codec_info(c, "AE-9 ACM: Phase 2 audio config C14=0x%02x\n",
+	codec_dbg(c, "AE-9 ACM: Phase 2 audio config C14=0x%02x\n",
 		   readl(s->mem_base + 0xC14) & 0xff);
 	ae9_i2c_send(c, "gpio1",   tx_gpio1,   ARRAY_SIZE(tx_gpio1));
 	ae9_i2c_send(c, "sr48",    tx_sr48,    ARRAY_SIZE(tx_sr48));
@@ -10002,7 +10001,7 @@ static void ae9_acm_init(struct hda_codec *c)
 	ae9_i2c_send(c, "mute2",   tx_mute2,   ARRAY_SIZE(tx_mute2));
 	ae9_i2c_send(c, "gpio2",   tx_gpio2,   ARRAY_SIZE(tx_gpio2));
 
-	codec_info(c, "AE-9 ACM: Phase 3 DAC routing C14=0x%02x\n",
+	codec_dbg(c, "AE-9 ACM: Phase 3 DAC routing C14=0x%02x\n",
 		   readl(s->mem_base + 0xC14) & 0xff);
 	ae9_i2c_send(c, "name",    tx_name,    ARRAY_SIZE(tx_name));
 	ae9_i2c_send(c, "pwr",     tx_pwr,     ARRAY_SIZE(tx_pwr));
@@ -10021,7 +10020,7 @@ static void ae9_acm_init(struct hda_codec *c)
 	ae9_i2c_send(c, "lbl_150", tx_lbl_150, ARRAY_SIZE(tx_lbl_150));
 	ae9_i2c_send(c, "unmute2", tx_unmute2, ARRAY_SIZE(tx_unmute2));
 
-	codec_info(c, "AE-9 ACM: init complete C14=0x%02x C7C=0x%02x\n",
+	codec_dbg(c, "AE-9 ACM: init complete C14=0x%02x C7C=0x%02x\n",
 		   readl(s->mem_base + 0xC14) & 0xff,
 		   readl(s->mem_base + 0xC7C) & 0xff);
 }
@@ -10118,7 +10117,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	int num_fx;
 	int idx, i;
 
-	codec_info(codec, "AE-9: ae9_setup_defaults() called, dsp_state=%d\n",
+	codec_dbg(codec, "AE-9: ae9_setup_defaults() called, dsp_state=%d\n",
 		   spec->dsp_state);
 
 	if (spec->dsp_state != DSP_DOWNLOADED) {
@@ -10127,7 +10126,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		return;
 	}
 
-	codec_info(codec, "AE-9: DSP ready, starting post-DSP setup\n");
+	codec_dbg(codec, "AE-9: DSP ready, starting post-DSP setup\n");
 	ae9_post_dsp_mmio_commands(codec);
 
 	/*
@@ -10162,7 +10161,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		unsigned int sync_val, status;
 		int i;
 
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: CA0113 handshake: 0x20c=0x%08x\n",
 			   readl(mem + 0x20c));
 
@@ -10264,7 +10263,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			goto handshake_done;
 		}
 
-		codec_info(codec, "AE-9: CA0113 sync OK (0xaa)\n");
+		codec_dbg(codec, "AE-9: CA0113 sync OK (0xaa)\n");
 
 		/* Step 5: Mode 1 rewrite (Windows VFIO line 1095) */
 		writel(0x00800001, mem + 0x20c);
@@ -10296,7 +10295,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		readl(mem + 0x208);  /* PCI barrier, returns 0xffffff80 */
 		msleep(16);
 		status = readl(mem + 0x208);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: CA0113 handshake token: 0x208=0x%08x (want 0xffff0001)\n",
 			   status);
 
@@ -10317,7 +10316,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		if (sync_val != 0xaa)
 			sync_val = readl(mem + 0x210);
 
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: CA0113 re-sync: 0x210=0x%08x\n",
 			   sync_val);
 
@@ -10338,7 +10337,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			readl(mem + 0x204);
 
 			msleep(20);
-			codec_info(codec,
+			codec_dbg(codec,
 				   "AE-9: CA0113 first cmd: 0x20c=0x%08x 0x860=%d 0x854=%d\n",
 				   readl(mem + 0x20c),
 				   readl(mem + 0x860),
@@ -10355,7 +10354,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		writew(0x0105, mem + 0x320);
 
 		spec->ca0113_ready = true;
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: CA0113 handshake complete, 0x20c=0x%08x 0x208=0x%08x\n",
 			   readl(mem + 0x20c), readl(mem + 0x208));
 
@@ -10365,7 +10364,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 				WIDGET_CHIP_CTRL, 0, 0xF90, 0);
 			unsigned int dp = snd_hda_codec_read(codec,
 				WIDGET_CHIP_CTRL, 0, 0xF8D, 0x0D);
-			codec_info(codec,
+			codec_dbg(codec,
 				   "AE-9 DIAG: 8051 @handshake: "
 				   "STATUS=0x%x dac2port=0x%x\n",
 				   st, dp);
@@ -10458,7 +10457,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		ca0113_mmio_command_set(codec, 0x48, 0x13, 0xff);
 		ca0113_mmio_command_set(codec, 0x48, 0x14, 0x7f);
 
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: CA0113 early DAC init: 0x20c=0x%08x 0x860=%d\n",
 			   readl(mem + 0x20c), readl(mem + 0x860));
 
@@ -10466,7 +10465,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		{
 			unsigned int st = snd_hda_codec_read(codec,
 				WIDGET_CHIP_CTRL, 0, 0xF90, 0);
-			codec_info(codec,
+			codec_dbg(codec,
 				   "AE-9 DIAG: 8051 @early_DAC: STATUS=0x%x\n",
 				   st);
 		}
@@ -10483,7 +10482,14 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	 * (stream_remap_data[1]) confirmed by matching boot router entries.
 	 */
 	mutex_lock(&spec->chipio_mutex);
-	chipio_remap_stream(codec, &stream_remap_data[0]);
+	/*
+	 * stream_remap_data[0] = stream 0x14 — NOT allocated by AE-9
+	 * firmware (exram offset = 0xff). Skip it to avoid remap failure.
+	 * stream_remap_data[1] = stream 0x0c — confirmed matching boot
+	 * router entries.
+	 */
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		chipio_remap_stream(codec, &stream_remap_data[0]);
 	chipio_remap_stream(codec, &stream_remap_data[1]);
 	mutex_unlock(&spec->chipio_mutex);
 
@@ -10663,7 +10669,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	{
 		unsigned int st = snd_hda_codec_read(codec,
 			WIDGET_CHIP_CTRL, 0, 0xF90, 0);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: 8051 @before_asi: STATUS=0x%x\n",
 			   st);
 	}
@@ -10678,7 +10684,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			WIDGET_CHIP_CTRL, 0, 0xF8D, 0x0D);
 		unsigned int asi = snd_hda_codec_read(codec,
 			WIDGET_CHIP_CTRL, 0, 0xF8D, 0x17);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: 8051 @after_asi: "
 			   "STATUS=0x%x dac2port=0x%x ASI=0x%x\n",
 			   st, dp, asi);
@@ -10711,7 +10717,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		chipio_8051_read_exram(codec, 0x1589, &off_11);
 		chipio_8051_read_exram(codec, 0x1590, &off_18);
 
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: exram offsets: "
 			   "0x05=%02x 0x0c=%02x 0x11=%02x 0x18=%02x\n",
 			   off_05, off_0c, off_11, off_18);
@@ -10722,7 +10728,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			for (j = 0; j < 12; j++) {
 				chipio_write_address(codec, base_addr + j * 4);
 				chipio_read_data(codec, &val);
-				codec_info(codec,
+				codec_dbg(codec,
 					   "AE-9 DIAG: router[0x0c+%d] "
 					   "@0x%06x = 0x%08x\n",
 					   j, base_addr + j * 4, val);
@@ -10735,7 +10741,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			for (j = 0; j < 6; j++) {
 				chipio_write_address(codec, base_addr + j * 4);
 				chipio_read_data(codec, &val);
-				codec_info(codec,
+				codec_dbg(codec,
 					   "AE-9 DIAG: router[0x18+%d] "
 					   "@0x%06x = 0x%08x\n",
 					   j, base_addr + j * 4, val);
@@ -10748,7 +10754,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			for (j = 0; j < 6; j++) {
 				chipio_write_address(codec, base_addr + j * 4);
 				chipio_read_data(codec, &val);
-				codec_info(codec,
+				codec_dbg(codec,
 					   "AE-9 DIAG: router[0x05+%d] "
 					   "@0x%06x = 0x%08x\n",
 					   j, base_addr + j * 4, val);
@@ -10773,7 +10779,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		chipio_get_stream_control(codec, 0x0c, &ctrl_0c);
 		chipio_get_stream_control(codec, 0x18, &ctrl_18);
 		mutex_unlock(&spec->chipio_mutex);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: stream states: 0x05=%u 0x0c=%u 0x18=%u "
 			   "(expect 0,1,1)\n",
 			   ctrl_05, ctrl_0c, ctrl_18);
@@ -10785,7 +10791,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		mutex_lock(&spec->chipio_mutex);
 		chipio_8051_read_exram(codec, 0x1584, &exram_0c);
 		mutex_unlock(&spec->chipio_mutex);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: before effects exram[0x0c]=%02x\n",
 			   exram_0c);
 	}
@@ -10827,7 +10833,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		 *   Phase 2: 0x80/0x04 = FLOAT_EIGHT (switch to Direct)
 		 * We only sent FLOAT_EIGHT. Try the 2-phase approach.
 		 */
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: effects loaded, keeping pipeline active "
 			   "(B2+B4 test)\n");
 
@@ -10844,7 +10850,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		mutex_lock(&spec->chipio_mutex);
 		chipio_get_stream_control(codec, 0x05, &ctrl_05_post);
 		mutex_unlock(&spec->chipio_mutex);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: after effects+pe_switch s05=%u\n",
 			   ctrl_05_post);
 	}
@@ -10871,7 +10877,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	 * Each writew sets/clears one pin — previous pins are preserved.
 	 */
 	ca0113_mmio_gpio_set(codec, 5, true);
-	codec_info(codec, "AE-9: GPIO 5 set (DAC power ON)\n");
+	codec_dbg(codec, "AE-9: GPIO 5 set (DAC power ON)\n");
 
 	/*
 	 * Wait for ACM MCU to boot after GPIO 5 released it from reset.
@@ -10904,12 +10910,12 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	{
 		unsigned int st = snd_hda_codec_read(codec,
 			WIDGET_CHIP_CTRL, 0, 0xF90, 0);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: 8051 @before_2nd_reset: STATUS=0x%x\n",
 			   st);
 	}
 
-	codec_info(codec, "AE-9: starting second PLL + engine reset\n");
+	codec_dbg(codec, "AE-9: starting second PLL + engine reset\n");
 	{
 		void __iomem *mem = spec->mem_base;
 		unsigned int val;
@@ -10958,7 +10964,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		writel(0x5a, mem + 0x210);
 		msleep(1);
 		val = readl(mem + 0x210);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: second reset sync = 0x%02x (expect 0xaa)\n",
 			   val & 0xff);
 
@@ -10969,7 +10975,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		writel(0x07, mem + 0x204);
 		msleep(16);
 		val = readl(mem + 0x860);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: second reset handshake 0x860=%d\n", val);
 
 		/* Token write */
@@ -11029,7 +11035,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		ca0113_mmio_command_set(codec, 0x49, 0x10, 0x7f);
 		ca0113_mmio_command_set(codec, 0x49, 0x0a, 0x07);
 
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: second PLL + engine reset complete\n");
 	}
 
@@ -11041,13 +11047,13 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 			WIDGET_CHIP_CTRL, 0, 0xF8D, 0x0D);
 		unsigned int asi = snd_hda_codec_read(codec,
 			WIDGET_CHIP_CTRL, 0, 0xF8D, 0x17);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: 8051 @after_2nd_reset: "
 			   "STATUS=0x%x dac2port=0x%x ASI=0x%x\n",
 			   st, dp, asi);
 	}
 
-	codec_info(codec, "AE-9: starting ACM bus init (mem_base=%p)\n",
+	codec_dbg(codec, "AE-9: starting ACM bus init (mem_base=%p)\n",
 		   spec->mem_base);
 	if (ae9_acm_bus_init(codec) == 0)
 		ae9_acm_init(codec);
@@ -11055,10 +11061,10 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		codec_warn(codec, "AE-9: ACM bus init failed, DAC may be silent\n");
 
 	ca0113_mmio_gpio_set(codec, 4, true);
-	codec_info(codec, "AE-9: GPIO 4 set C14=0x%02x\n",
+	codec_dbg(codec, "AE-9: GPIO 4 set C14=0x%02x\n",
 		   readl(spec->mem_base + 0xC14) & 0xff);
 
-	codec_info(codec, "AE-9: calling alt_select_out C14=0x%02x\n",
+	codec_dbg(codec, "AE-9: calling alt_select_out C14=0x%02x\n",
 		   readl(spec->mem_base + 0xC14) & 0xff);
 	/*
 	 * AE-9: Force headphone gain preset to "High" (index 2).
@@ -11070,7 +11076,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	 */
 	spec->ae5_headphone_gain_val = 2;
 	ca0132_alt_select_out(codec);
-	codec_info(codec, "AE-9: after select_out C14=0x%02x\n",
+	codec_dbg(codec, "AE-9: after select_out C14=0x%02x\n",
 		   readl(spec->mem_base + 0xC14) & 0xff);
 
 	/*
@@ -11082,7 +11088,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	 * when the codec is freed.
 	 */
 	ae9_keepalive_start(spec);
-	codec_info(codec, "AE-9: keepalive STARTED C14=0x%02x\n",
+	codec_dbg(codec, "AE-9: keepalive STARTED C14=0x%02x\n",
 		   readl(spec->mem_base + 0xC14) & 0xff);
 	/* DIAG: check if stream 0x0c survived the entire setup */
 	{
@@ -11090,7 +11096,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 		mutex_lock(&spec->chipio_mutex);
 		chipio_8051_read_exram(codec, 0x1584, &exram_0c);
 		mutex_unlock(&spec->chipio_mutex);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9 DIAG: end of setup_defaults exram[0x0c]=%02x "
 			   "(want 0x0c, 0xff=DEAD)\n", exram_0c);
 	}
@@ -11263,7 +11269,7 @@ static void ca0132_process_dsp_response(struct hda_codec *codec,
 {
 	struct ca0132_spec *spec = codec->spec;
 
-	codec_dbg(codec, "ca0132_process_dsp_response\n");
+	/* codec_dbg(codec, "ca0132_process_dsp_response\n"); */
 	snd_hda_power_up_pm(codec);
 	if (spec->wait_scp) {
 		if (dspio_get_response_data(codec) >= 0)
@@ -11738,14 +11744,14 @@ static void sbz_dsp_startup_check(struct hda_codec *codec)
 
 	codec_dbg(codec, "Startup Check: %d ", failure);
 	if (failure)
-		codec_info(codec, "DSP not initialized properly. Attempting to fix.");
+		codec_dbg(codec, "DSP not initialized properly. Attempting to fix.");
 	/*
 	 * While the failure condition is true, and we haven't reached our
 	 * three reload limit, continue trying to reload the driver and
 	 * fix the issue.
 	 */
 	while (failure && (reload != 0)) {
-		codec_info(codec, "Reloading... Tries left: %d", reload);
+		codec_dbg(codec, "Reloading... Tries left: %d", reload);
 		sbz_exit_chip(codec);
 		spec->dsp_state = DSP_DOWNLOAD_INIT;
 		failure = 0;
@@ -11761,12 +11767,12 @@ static void sbz_dsp_startup_check(struct hda_codec *codec)
 	}
 
 	if (!failure && reload < 3)
-		codec_info(codec, "DSP fixed.");
+		codec_dbg(codec, "DSP fixed.");
 
 	if (!failure)
 		return;
 
-	codec_info(codec, "DSP failed to initialize properly. Either try a full shutdown or a suspend to clear the internal memory.");
+	codec_dbg(codec, "DSP failed to initialize properly. Either try a full shutdown or a suspend to clear the internal memory.");
 }
 
 /*
@@ -12217,7 +12223,7 @@ static void ae5_register_set(struct hda_codec *codec)
 		 * AFTER PLL/clock are configured so it re-inits with
 		 * correct timings.
 		 */
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: ae5_register_set: GPIO+VIP+RESET sequence\n");
 
 		/* Items 1-5: GPIO and chipio params (all work without CA0113) */
@@ -12245,7 +12251,7 @@ static void ae5_register_set(struct hda_codec *codec)
 		chipio_set_control_flag(codec, CONTROL_FLAG_IDLE_ENABLE, 0);
 
 		/* Item 11: CODEC_RESET x2 AFTER PLL/clock setup */
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: ae5_register_set: CODEC_RESET x2 "
 			   "(post-PLL, 0x20c=0x%08x)\n",
 			   readl(spec->mem_base + 0x20c));
@@ -12253,7 +12259,7 @@ static void ae5_register_set(struct hda_codec *codec)
 				    AC_VERB_SET_CODEC_RESET, 0);
 		snd_hda_codec_write(codec, codec->core.afg, 0,
 				    AC_VERB_SET_CODEC_RESET, 0);
-		codec_info(codec,
+		codec_dbg(codec,
 			   "AE-9: ae5_register_set: CODEC_RESET done, "
 			   "0x20c=0x%08x\n",
 			   readl(spec->mem_base + 0x20c));
@@ -12398,7 +12404,7 @@ static int ca0132_init(struct hda_codec *codec)
 	if (ca0132_use_pci_mmio(spec))
 		ca0132_mmio_init(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after mmio_init 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
+		codec_dbg(codec, "AE-9 DIAG: after mmio_init 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	snd_hda_power_up_pm(codec);
 
@@ -12407,18 +12413,18 @@ static int ca0132_init(struct hda_codec *codec)
 	    ca0132_quirk(spec) == QUIRK_AE9)
 		ae5_register_set(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after ae5_register_set 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
+		codec_dbg(codec, "AE-9 DIAG: after ae5_register_set 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	ca0132_init_params(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after init_params 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
+		codec_dbg(codec, "AE-9 DIAG: after init_params 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 	ca0132_init_flags(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after init_flags 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
+		codec_dbg(codec, "AE-9 DIAG: after init_flags 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	snd_hda_sequence_write(codec, spec->base_init_verbs);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after base_init_verbs 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
+		codec_dbg(codec, "AE-9 DIAG: after base_init_verbs 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	/*
 	 * AE-9: ca0132_ca0113_init_ae9() removed. GPIO5, VIP_SOURCE,
@@ -12429,11 +12435,11 @@ static int ca0132_init(struct hda_codec *codec)
 	if (ca0132_use_alt_functions(spec))
 		ca0132_alt_init(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after alt_init 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
+		codec_dbg(codec, "AE-9 DIAG: after alt_init 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	ca0132_download_dsp(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9)
-		codec_info(codec, "AE-9 DIAG: after dsp_download 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
+		codec_dbg(codec, "AE-9 DIAG: after dsp_download 0x20c=0x%08x\n", readl(spec->mem_base + 0x20c));
 
 	ca0132_refresh_widget_caps(codec);
 
@@ -12478,7 +12484,7 @@ static int ca0132_init(struct hda_codec *codec)
 		mutex_lock(&spec->chipio_mutex);
 		chipio_8051_read_exram(codec, 0x1584, &ex);
 		mutex_unlock(&spec->chipio_mutex);
-		codec_info(codec, "AE-9 DIAG: after init_output exram[0x0c]=%02x\n", ex);
+		codec_dbg(codec, "AE-9 DIAG: after init_output exram[0x0c]=%02x\n", ex);
 	}
 
 	init_output(codec, cfg->dig_out_pins[0], spec->dig_out);
@@ -12493,7 +12499,7 @@ static int ca0132_init(struct hda_codec *codec)
 		mutex_lock(&spec->chipio_mutex);
 		chipio_8051_read_exram(codec, 0x1584, &ex);
 		mutex_unlock(&spec->chipio_mutex);
-		codec_info(codec, "AE-9 DIAG: after init_input exram[0x0c]=%02x\n", ex);
+		codec_dbg(codec, "AE-9 DIAG: after init_input exram[0x0c]=%02x\n", ex);
 	}
 
 	if (!ca0132_use_alt_functions(spec)) {
@@ -12514,7 +12520,7 @@ static int ca0132_init(struct hda_codec *codec)
 		mutex_lock(&spec->chipio_mutex);
 		chipio_8051_read_exram(codec, 0x1584, &ex);
 		mutex_unlock(&spec->chipio_mutex);
-		codec_info(codec, "AE-9 DIAG: after spec_init_verbs exram[0x0c]=%02x\n", ex);
+		codec_dbg(codec, "AE-9 DIAG: after spec_init_verbs exram[0x0c]=%02x\n", ex);
 	}
 
 	if (ca0132_use_alt_functions(spec)) {
@@ -12525,7 +12531,7 @@ static int ca0132_init(struct hda_codec *codec)
 			mutex_lock(&spec->chipio_mutex);
 			chipio_8051_read_exram(codec, 0x1584, &ex);
 			mutex_unlock(&spec->chipio_mutex);
-			codec_info(codec, "AE-9 DIAG: after final select_out exram[0x0c]=%02x\n", ex);
+			codec_dbg(codec, "AE-9 DIAG: after final select_out exram[0x0c]=%02x\n", ex);
 		}
 
 		ca0132_alt_select_in(codec);
@@ -12982,7 +12988,7 @@ static int ca0132_codec_probe(struct hda_codec *codec, const struct hda_device_i
 		/* AE-9 check: PCI subsystem device 0x0071 */
 		if (codec->bus->pci &&
 		    codec->bus->pci->subsystem_device == 0x0071) {
-			codec_info(codec,
+			codec_dbg(codec,
 				"AE-9: claiming D2 for ACM communication\n");
 
 			spec_d2 = kzalloc(sizeof(*spec_d2), GFP_KERNEL);
