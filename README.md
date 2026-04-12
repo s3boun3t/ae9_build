@@ -75,13 +75,6 @@ sudo poweroff
 
 ```
 
-### Project structure
-
-```
-build/          kernel module source (ca0132.c + Makefile)
-docs/           protocol documentation, CORB captures, register maps
-```
-
 ### Wiki
 
 Detailed technical documentation is available in the
