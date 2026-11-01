@@ -1195,7 +1195,7 @@ struct ca0132_spec {
 	bool ae9_pm_held;		/* runtime-PM reference held: codec stays in D0 */
 	int ae9_knob_acc;		/* encoder detents not yet turned into volume points */
 	int ae9_knob_dir;		/* last encoder direction seen (Windows: board+0x288) */
-	bool ae9_dsp_vol_zeroed;	/* DSP output volume parked at 0 dB (curve lives on the amp) */
+	bool ae9_dsp_vol_zeroed;	/* DSP at 0 dB; output gain lives on the amp */
 	bool ae9_acm_regs_logged;	/* first periodic ACM register check logged */
 	bool ae9_hp_jack_valid;		/* physical headphone state sampled */
 	bool ae9_hp_jack_present;	/* ACM reg2 bit5 is active low */
@@ -6745,25 +6745,6 @@ static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
  * ADC for input. Currently only the SBZ sets dsp capture volume level, and
  * all alternative codecs set DSP playback volume.
  */
-/* Windows CtxHda master-volume curve (.data 0x118da0): index 0..100 -> 0.01 dB.
- * One knob point = one index; the DSP gets this single attenuation and the DAC
- * amp stays at 0 dB, so the 0..99 Master level sounds like Windows' 0..100. */
-static const s16 ae9_win_vol_db100[101] = {
-	 -9000,  -6642,  -5758,  -5203,  -4798,  -4478,  -4213,  -3989,
-	 -3793,  -3619,  -3463,  -3322,  -3193,  -3074,  -2963,  -2860,
-	 -2764,  -2673,  -2588,  -2507,  -2430,  -2357,  -2287,  -2220,
-	 -2156,  -2095,  -2036,  -1979,  -1924,  -1871,  -1820,  -1771,
-	 -1723,  -1677,  -1632,  -1588,  -1545,  -1504,  -1464,  -1425,
-	 -1386,  -1349,  -1313,  -1277,  -1242,  -1208,  -1175,  -1143,
-	 -1111,  -1080,  -1049,  -1019,   -990,   -961,   -933,   -905,
-	  -878,   -851,   -825,   -799,   -773,   -748,   -724,   -700,
-	  -676,   -652,   -629,   -606,   -584,   -562,   -540,   -519,
-	  -497,   -476,   -456,   -436,   -415,   -396,   -376,   -357,
-	  -338,   -319,   -300,   -282,   -264,   -246,   -228,   -211,
-	  -193,   -176,   -159,   -143,   -126,   -110,    -93,    -77,
-	   -61,    -46,    -30,    -15,      0,
-};
-
 /* The DSP latches this module's value at stream start, so it must be at 0 dB
  * BEFORE any stream (WirePlumber's probe streams, the first Spotify stream)
  * opens the device; a stale value stays in effect until the device is closed. */
@@ -6782,33 +6763,29 @@ static void ae9_dsp_volume_unity(struct hda_codec *codec)
 	spec->ae9_dsp_vol_zeroed = true;
 }
 
-/* AE-9: Master level L (0..99) -> the Windows curve, applied where Windows
- * applies it: the DACs' own volume registers (ES9038 0x0f/0x10 for the ACM
- * headphones, SABRE9006 0x02/0x04 for the line-out), 0.5 dB per step. The
- * codec amp on nid 0x02 and the DSP output volume stay at 0 dB so the DSP
- * processes a full-scale signal, as on Windows (capture: display "-10.5" <->
- * 0x0f/0x10 = 0x15). Earlier attempts: DSP volume = latched at stream start,
- * codec amp = works but attenuates before the DSP. */
-static void ae9_master_apply(struct hda_codec *codec, long lvol, long rvol)
+/* Use the same HDA dB steps that ALSA advertises, without a second curve. */
+static int ae9_master_apply(struct snd_kcontrol *kcontrol,
+			    struct snd_ctl_elem_value *ucontrol)
 {
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
-	unsigned int widx_l = clamp(lvol, 0L, 99L) * 100 / 99;
-	unsigned int widx_r = clamp(rvol, 0L, 99L) * 100 / 99;
-	unsigned int vl = clamp(DIV_ROUND_CLOSEST(-(int)ae9_win_vol_db100[widx_l], 50), 0, 255);
-	unsigned int vr = clamp(DIV_ROUND_CLOSEST(-(int)ae9_win_vol_db100[widx_r], 50), 0, 255);
+	long *valp = ucontrol->value.integer.value;
+	int ch = get_amp_channels(kcontrol);
+	int err;
 
-	int al = clamp(90 + DIV_ROUND_CLOSEST((int)ae9_win_vol_db100[widx_l], 100), 0, 90);
-	int ar = clamp(90 + DIV_ROUND_CLOSEST((int)ae9_win_vol_db100[widx_r], 100), 0, 90);
-
-	/* Baseline: the Windows curve on the nid 0x02 DAC amp (a plain HDA verb).
-	 * The DAC-register variant (ES9038 0x0f/0x10 via the BAR2 command engine,
-	 * what Windows does) is parked until the audio path is proven stable: it
-	 * put command-engine traffic into the playback window. vl/vr kept for it. */
-	(void)vl; (void)vr;
+	CLASS(snd_hda_power, pm)(codec);
 	ae9_dsp_volume_unity(codec);
-	snd_hda_codec_amp_update(codec, 0x02, 0, HDA_OUTPUT, 0, HDA_AMP_VOLMASK, al);
-	snd_hda_codec_amp_update(codec, 0x02, 1, HDA_OUTPUT, 0, HDA_AMP_VOLMASK, ar);
-	spec->ae9_acm_disp_dirty = true;
+	guard(mutex)(&codec->control_mutex);
+	err = snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
+	/* A failed stereo put may already have changed one channel. */
+	WRITE_ONCE(spec->ae9_acm_disp_dirty, true);
+	if (err < 0)
+		return err;
+	if (ch & 1)
+		spec->vnode_lvol[VNID_SPK - VNODE_START_NID] = *valp++;
+	if (ch & 2)
+		spec->vnode_rvol[VNID_SPK - VNODE_START_NID] = *valp;
+	return err;
 }
 
 static void ca0132_alt_dsp_volume_put(struct hda_codec *codec, hda_nid_t nid)
@@ -6964,6 +6941,9 @@ static int ca0132_alt_volume_put(struct snd_kcontrol *kcontrol,
 		break;
 	}
 
+	if (ca0132_quirk(spec) == QUIRK_AE9 && vnid == VNID_SPK)
+		return ae9_master_apply(kcontrol, ucontrol);
+
 	/* store the left and right volume */
 	if (ch & 1) {
 		spec->vnode_lvol[vnid - VNODE_START_NID] = *valp;
@@ -6975,11 +6955,6 @@ static int ca0132_alt_volume_put(struct snd_kcontrol *kcontrol,
 	}
 
 	CLASS(snd_hda_power, pm)(codec);
-	if (ca0132_quirk(spec) == QUIRK_AE9 && vnid == VNID_SPK) {
-		ae9_master_apply(codec, spec->vnode_lvol[vnid - VNODE_START_NID],
-				 spec->vnode_rvol[vnid - VNODE_START_NID]);
-		return 1;
-	}
 	ca0132_alt_dsp_volume_put(codec, vnid);
 	guard(mutex)(&codec->control_mutex);
 	return snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
@@ -7857,10 +7832,29 @@ static void init_input(struct hda_codec *codec, hda_nid_t pin, hda_nid_t adc)
 
 static void refresh_amp_caps(struct hda_codec *codec, hda_nid_t nid, int dir)
 {
+	struct ca0132_spec *spec = codec->spec;
 	unsigned int caps;
+	unsigned int steps, zero_db;
+	int i;
 
 	caps = snd_hda_param_read(codec, nid, dir == HDA_OUTPUT ?
 				  AC_PAR_AMP_OUT_CAP : AC_PAR_AMP_IN_CAP);
+	if (ca0132_quirk(spec) == QUIRK_AE9 && dir == HDA_OUTPUT) {
+		for (i = 0; i < spec->multiout.num_dacs; i++) {
+			if (nid != spec->dacs[i])
+				continue;
+			/* All volume followers must share the 0 dB ceiling. */
+			steps = (caps & AC_AMPCAP_NUM_STEPS) >>
+				AC_AMPCAP_NUM_STEPS_SHIFT;
+			zero_db = (caps & AC_AMPCAP_OFFSET) >>
+				  AC_AMPCAP_OFFSET_SHIFT;
+			if (steps > zero_db) {
+				caps &= ~AC_AMPCAP_NUM_STEPS;
+				caps |= zero_db << AC_AMPCAP_NUM_STEPS_SHIFT;
+			}
+			break;
+		}
+	}
 	snd_hda_override_amp_caps(codec, nid, dir, caps);
 }
 
@@ -9488,28 +9482,32 @@ static void ae9_acm_display(struct ca0132_spec *spec, const char *txt)
  * scaled copy in vnode_lvol (using the latter as the knob's base made every
  * tick shrink the level when the follower was below 100%).
  */
-static long ae9_master_level(struct hda_codec *codec, struct snd_kcontrol **kctlp)
+static long ae9_master_level(struct hda_codec *codec,
+			     struct snd_kcontrol **kctlp, long *max_level)
 {
-	struct ca0132_spec *spec = codec->spec;
 	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, "Master Playback Volume");
+	struct snd_ctl_elem_info info = { 0 };
 	struct snd_ctl_elem_value *uctl;
-	long v = spec->vnode_lvol[VNID_SPK - VNODE_START_NID];
+	long v;
+	int err;
 
 	if (kctlp)
 		*kctlp = kctl;
-	if (!kctl || !kctl->get)
-		return v;
+	if (!kctl || !kctl->get || !kctl->info)
+		return -ENOENT;
+	err = kctl->info(kctl, &info);
+	if (err < 0)
+		return err;
+	*max_level = info.value.integer.max;
 	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
 	if (!uctl)
-		return v;
-	if (kctl->get(kctl, uctl) >= 0)
-		v = uctl->value.integer.value[0];
+		return -ENOMEM;
+	err = kctl->get(kctl, uctl);
+	v = err < 0 ? err : uctl->value.integer.value[0];
 	kfree(uctl);
 	return v;
 }
 
-/* Windows shows the level in dB (-90.0 .. 0.0), i.e. the Windows table value
- * for the current step, not the 0..99 index. */
 static bool ae9_master_muted(struct hda_codec *codec)
 {
 	struct snd_kcontrol *kctl = snd_hda_find_mixer_ctl(codec, "Master Playback Switch");
@@ -9529,14 +9527,34 @@ static bool ae9_master_muted(struct hda_codec *codec)
 
 static void ae9_acm_show_volume(struct ca0132_spec *spec)
 {
-	long lvl = clamp(ae9_master_level(spec->codec, NULL), 0L, 99L);
-	int db100 = -ae9_win_vol_db100[lvl * 100 / 99];	/* positive magnitude */
+	struct hda_codec *codec = spec->codec;
+	unsigned int caps;
+	int left, right, offset, step, db100;
 	char txt[9];
 
-	if (ae9_master_muted(spec->codec))
+	if (ae9_master_muted(codec)) {
 		snprintf(txt, sizeof(txt), "MUTE");
-	else
-		snprintf(txt, sizeof(txt), "%s%d.%d", db100 ? "-" : "", db100 / 100, (db100 % 100) / 10);
+	} else {
+		/* Show the louder channel after Master and follower attenuation. */
+		scoped_guard(mutex, &codec->control_mutex) {
+			left = snd_hda_codec_amp_read(codec, 0x02, 0,
+						      HDA_OUTPUT, 0);
+			right = snd_hda_codec_amp_read(codec, 0x02, 1,
+						       HDA_OUTPUT, 0);
+		}
+		caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
+		if (left < 0 || right < 0 || caps == ~0U) {
+			WRITE_ONCE(spec->ae9_acm_disp_dirty, true);
+			return;
+		}
+		offset = (caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT;
+		step = ((caps & AC_AMPCAP_STEP_SIZE) >>
+			AC_AMPCAP_STEP_SIZE_SHIFT) + 1;
+		db100 = (max(left & HDA_AMP_VOLMASK,
+			     right & HDA_AMP_VOLMASK) - offset) * step * 25;
+		snprintf(txt, sizeof(txt), "%s%d.%d", db100 < 0 ? "-" : "",
+			 abs(db100) / 100, (abs(db100) % 100) / 10);
+	}
 	ae9_acm_display_frame(spec, txt, false);
 }
 
@@ -9862,9 +9880,9 @@ static bool ae9_acm_init(struct hda_codec *codec)
 /* Volume knob: F0 C2 00 F7 -> RX 8: [3] dir, [4] detents, [5..6] ms (fw >= 0x01957D60).
  * Mapping decoded from CtxHda 0x3f8a8 + board 0x35298 (2026-09-08):
  *  - dir 0 = clockwise = louder, dir 1 = quieter (the board subtracts on dir 1);
- *  - detents go through an accumulator, 2 detents = 1 volume point (one index
- *    of Windows' 101-point volume table); on a direction change the remainder
- *    is dropped and a single detent counts as 2 so it moves immediately.
+ *  - detents go through an accumulator, 2 detents = 1 ALSA volume step;
+ *    on a direction change the remainder is dropped and a single detent
+ *    counts as 2 so it moves immediately.
  * Windows' ms-based acceleration (x2/x3/x4 for >4 detents per 50 ms poll) is
  * deliberately NOT applied: our poll is slower, so it fired on normal turning
  * and produced +40..+64 jumps. */
@@ -9876,7 +9894,7 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	struct snd_ctl_elem_value *uctl;
 	u8 rx[8];
 	int n, dir, steps, delta;
-	long v;
+	long v, max_level;
 
 	ae9_acm_tx(spec, q, sizeof(q));
 	n = ae9_acm_rx(spec, rx, 8, 30);
@@ -9898,18 +9916,20 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	spec->ae9_acm_turbo = 10;
 	if (!delta)
 		return;
-	v = ae9_master_level(codec, &kctl);
-	v = clamp(v + delta, 0L, 99L);
-	codec_info(codec, "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n", dir, rx[4], delta, v);
-	if (!kctl || !kctl->put)
+	v = ae9_master_level(codec, &kctl, &max_level);
+	if (v < 0 || !kctl || !kctl->put)
 		return;
+	v = clamp(v + delta, 0L, max_level);
+	codec_info(codec, "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n", dir, rx[4], delta, v);
 	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
 	if (!uctl)
 		return;
 	uctl->value.integer.value[0] = v;
 	uctl->value.integer.value[1] = v;
-	kctl->put(kctl, uctl);		/* vmaster -> shared output volume */
+	n = kctl->put(kctl, uctl);		/* vmaster -> shared output volume */
 	kfree(uctl);
+	if (n <= 0)
+		return;
 	snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
 	spec->ae9_acm_disp_dirty = true;
 }
@@ -11949,7 +11969,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto4");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

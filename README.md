@@ -58,3 +58,15 @@ autres périphériques audio. La capture AE-9 reste désactivée par défaut.
   pas force a `true`. La valeur standard est `false` ; l'ancienne regle
   locale de depannage doit etre corrigee si elle est encore presente.
   Le pilote ne modifie pas les fichiers de configuration de la session.
+
+- `hpauto5` : pas HDA réels et décibels ALSA alignés, plafond à 0 dB,
+  affichage ACM calculé sur le gain effectif. L'utilisateur confirme
+  l'accord au maximum avec Mint et les points intermédiaires ; −90 dB
+  correspond à environ 3,2 %, le muet restant distinct.
+
+La référence essayée est Linux Mint 22.3, XanMod
+`7.2.14-x64v3-xanmod1`, avec `iommu=pt`,
+`ae9_capture=0`, `ae9_mic=0` et `ae9_acm_poll=1`. Cela ne qualifie pas
+les autres noyaux, la capture, la reprise de veille ou les autres cartes.
+Un délai ACM/Mint subsiste et reste en cours de mesure ; aucune modification
+des échanges d'entretien destinée à le réduire n'est incluse.
