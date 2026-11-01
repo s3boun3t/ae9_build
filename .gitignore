@@ -1,18 +1,43 @@
-# Build artifacts — never track these
-.claude/
-build/*.o
-build/*.mod
-build/*.mod.c
-build/*.mod.o
-build/.*.cmd
-build/*.symvers
-build/modules.order
-build/.gitignore
-build/snd-hda-codec-ca0132.ko
-linux-6.17.tar.xz
-linux-source/
+# Kernel build outputs
+*.o
+*.a
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.symvers
+modules.order
+.*.cmd
+.tmp_versions/
+*.d
+/build/
+
+# Firmware and extracted proprietary payloads
+*.bin
 *.hda
 *.payload
-*.bin
-*.ko
+
+# Local sources, captures, logs and backups
+/linux-source/
+/linux-*.tar.*
+/logs/
+/captures/
+/backups/
+*.log
+*.bak
+*.orig
+*.rej
+*~
+
+# Editor and Python caches
+.claude/
+.cache/
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+.env
+.env.*
+
+# Existing local capture exclusion
 docs/ae9_vfio_boot_25mars.log
