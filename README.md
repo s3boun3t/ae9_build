@@ -49,3 +49,12 @@ autres périphériques audio. La capture AE-9 reste désactivée par défaut.
 - `hpauto2` : detection de la fiche casque ACM et bascule automatique vers
   `Headphone` a l'insertion, `Speakers` au retrait. Reponses ACM `83`
   validees et changements observes sur le materiel de reference.
+
+- `hpauto4` : controle partage `Headphone+LO` pour le chemin casque et
+  ligne, avec notification du muet Master. Son, muet et synchronisation
+  ACM/Mint dans les deux sens confirmes par l'utilisateur.
+
+  La synchronisation materielle exige que `api.alsa.soft-mixer` ne soit
+  pas force a `true`. La valeur standard est `false` ; l'ancienne regle
+  locale de depannage doit etre corrigee si elle est encore presente.
+  Le pilote ne modifie pas les fichiers de configuration de la session.

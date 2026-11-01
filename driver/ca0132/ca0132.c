@@ -7305,6 +7305,10 @@ static const char * const ca0132_alt_follower_pfxs[] = {
 	"Front", "Surround", "Center", "LFE", NULL,
 };
 
+static const char * const ae9_follower_pfxs[] = {
+	"Headphone+LO", "Surround", "Center", "LFE", NULL,
+};
+
 /*
  * Also need special channel map, because the default one is incorrect.
  * I think this has to do with the pin for rear surround being 0x11,
@@ -7396,6 +7400,17 @@ static const struct snd_kcontrol_new desktop_mixer[] = {
 };
 
 /*
+ * The AE-9 uses the same DAC path for ACM headphones and front line-out.
+ * ACP mutes a Front switch on the headphone port; Headphone+LO is its shared
+ * output element and follows volume/mute on both ports instead.
+ */
+static const struct snd_kcontrol_new ae9_shared_mixer[] = {
+	CA0132_ALT_CODEC_VOL("Headphone+LO Playback Volume", 0x02, HDA_OUTPUT),
+	CA0132_CODEC_MUTE("Headphone+LO Playback Switch", VNID_SPK, HDA_OUTPUT),
+	{ } /* end */
+};
+
+/*
  * Same as the Sound Blaster Z, except doesn't use the alt volume for capture
  * because it doesn't set decibel levels for the DSP for capture.
  */
@@ -7417,6 +7432,15 @@ static const struct snd_kcontrol_new r3di_mixer[] = {
 	{ } /* end */
 };
 
+static void ae9_vmaster_mute_changed(void *private_data, int enabled)
+{
+	struct ca0132_spec *spec = private_data;
+
+	(void)enabled;
+	/* Refresh from the committed Master state in the ACM worker. */
+	WRITE_ONCE(spec->ae9_acm_disp_dirty, true);
+}
+
 static int ca0132_build_controls(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -7431,17 +7455,28 @@ static int ca0132_build_controls(struct hda_codec *codec)
 	}
 	/* Setup vmaster with surround followers for desktop ca0132 devices */
 	if (ca0132_use_alt_functions(spec)) {
+		const char * const *followers = ca0132_alt_follower_pfxs;
+
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			followers = ae9_follower_pfxs;
 		snd_hda_set_vmaster_tlv(codec, spec->dacs[0], HDA_OUTPUT,
 					spec->tlv);
 		snd_hda_add_vmaster(codec, "Master Playback Volume",
-					spec->tlv, ca0132_alt_follower_pfxs,
+					spec->tlv, followers,
 					"Playback Volume", 0);
 		err = __snd_hda_add_vmaster(codec, "Master Playback Switch",
-					    NULL, ca0132_alt_follower_pfxs,
+					    NULL, followers,
 					    "Playback Switch",
 					    true, 0, &spec->vmaster_mute.sw_kctl);
 		if (err < 0)
 			return err;
+		if (ca0132_quirk(spec) == QUIRK_AE9 &&
+		    spec->vmaster_mute.sw_kctl) {
+			err = snd_ctl_add_vmaster_hook(spec->vmaster_mute.sw_kctl,
+						       ae9_vmaster_mute_changed, spec);
+			if (err < 0)
+				return err;
+		}
 	}
 
 	/* Add in and out effects controls.
@@ -9447,10 +9482,12 @@ static void ae9_acm_display(struct ca0132_spec *spec, const char *txt)
 	ae9_acm_display_frame(spec, txt, true);
 }
 
-/* 'Master Playback Volume' on the AE-9 is a virtual master whose slave is
- * 'Front'; the level the user sees/turns is the master's own value, not the
- * slave's scaled copy in vnode_lvol (using the latter as the knob's base made
- * every tick shrink the level when Front was below 100%). */
+/*
+ * 'Master Playback Volume' on the AE-9 follows the shared Headphone+LO output.
+ * The level the user sees/turns is the master's own value, not the follower's
+ * scaled copy in vnode_lvol (using the latter as the knob's base made every
+ * tick shrink the level when the follower was below 100%).
+ */
 static long ae9_master_level(struct hda_codec *codec, struct snd_kcontrol **kctlp)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -9871,7 +9908,7 @@ static void ae9_acm_knob(struct hda_codec *codec)
 		return;
 	uctl->value.integer.value[0] = v;
 	uctl->value.integer.value[1] = v;
-	kctl->put(kctl, uctl);		/* vmaster -> Front put -> ae9_master_apply */
+	kctl->put(kctl, uctl);		/* vmaster -> shared output volume */
 	kfree(uctl);
 	snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
 	spec->ae9_acm_disp_dirty = true;
@@ -11773,7 +11810,10 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		snd_hda_codec_set_name(codec, "Sound BlasterX AE-5");
 		break;
 	case QUIRK_AE9:
-		spec->mixers[0] = desktop_mixer;
+		/* Replace only the Front pair; keep the other desktop controls. */
+		spec->mixers[0] = ae9_shared_mixer;
+		spec->mixers[1] = desktop_mixer + 2;
+		spec->num_mixers = 2;
 		snd_hda_codec_set_name(codec, "Sound Blaster AE-9");
 		break;
 	case QUIRK_AE7:
@@ -11909,7 +11949,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto2");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto4");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
