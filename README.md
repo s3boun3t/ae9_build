@@ -40,3 +40,8 @@ autres périphériques audio. La capture AE-9 reste désactivée par défaut.
 
 - Base DarkNikGr : sources du pilote inchangées. Sur le noyau XanMod 7.2.14
   étudié ici, l'adaptation ABI du commit suivant est nécessaire avant essai.
+
+- `abi1` : disposition de `hda_multi_out` alignee sur celle du noyau
+  `7.2.14-x64v3-xanmod1` pour eviter un ecrasement des broches de sortie
+  par le helper SPDIF natif. Lecture casque confirmee par l'utilisateur
+  dans cette configuration ; autres noyaux non qualifies.
