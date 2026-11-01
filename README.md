@@ -45,3 +45,7 @@ autres périphériques audio. La capture AE-9 reste désactivée par défaut.
   `7.2.14-x64v3-xanmod1` pour eviter un ecrasement des broches de sortie
   par le helper SPDIF natif. Lecture casque confirmee par l'utilisateur
   dans cette configuration ; autres noyaux non qualifies.
+
+- `hpauto2` : detection de la fiche casque ACM et bascule automatique vers
+  `Headphone` a l'insertion, `Speakers` au retrait. Reponses ACM `83`
+  validees et changements observes sur le materiel de reference.

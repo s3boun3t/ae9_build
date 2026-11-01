@@ -1197,6 +1197,9 @@ struct ca0132_spec {
 	int ae9_knob_dir;		/* last encoder direction seen (Windows: board+0x288) */
 	bool ae9_dsp_vol_zeroed;	/* DSP output volume parked at 0 dB (curve lives on the amp) */
 	bool ae9_acm_regs_logged;	/* first periodic ACM register check logged */
+	bool ae9_hp_jack_valid;		/* physical headphone state sampled */
+	bool ae9_hp_jack_present;	/* ACM reg2 bit5 is active low */
+	struct mutex ae9_output_mutex;	/* output selection and ACM mode */
 	int ae9_acm_dead_ticks;		/* consecutive keepalive probes unanswered */
 	int ae9_acm_sel;		/* module's own output selector bits last seen (items 5/6) */
 
@@ -5009,7 +5012,7 @@ static void ca0132_set_out_node_pincfg(struct hda_codec *codec, hda_nid_t nid,
  * will detect either headphone or lineout(SPEAKER_OUT) from jack detection.
  * It also adds the ability to auto-detect the front headphone port.
  */
-static int ca0132_alt_select_out(struct hda_codec *codec)
+static int __ca0132_alt_select_out(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	unsigned int tmp, outfx_set;
@@ -5157,6 +5160,40 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 	}
 
 	return 0;
+}
+
+static int ca0132_alt_select_out(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int err;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return __ca0132_alt_select_out(codec);
+
+	CLASS(snd_hda_power_pm, pm)(codec);
+	mutex_lock(&spec->ae9_output_mutex);
+	err = __ca0132_alt_select_out(codec);
+	mutex_unlock(&spec->ae9_output_mutex);
+	return err;
+}
+
+static int ae9_select_output_locked(struct hda_codec *codec, int output)
+{
+	struct ca0132_spec *spec = codec->spec;
+	int old_output = spec->out_enum_val;
+	int old_type = spec->cur_out_type;
+	bool old_pending = spec->ae9_acm_pending_mode;
+	int err;
+
+	lockdep_assert_held(&spec->ae9_output_mutex);
+	spec->out_enum_val = output;
+	err = __ca0132_alt_select_out(codec);
+	if (err < 0) {
+		spec->out_enum_val = old_output;
+		spec->cur_out_type = old_type;
+		spec->ae9_acm_pending_mode = old_pending;
+	}
+	return err;
 }
 
 static void ca0132_unsol_hp_delayed(struct work_struct *work)
@@ -6274,7 +6311,13 @@ static int ca0132_alt_output_select_get(struct snd_kcontrol *kcontrol,
 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct ca0132_spec *spec = codec->spec;
 
-	ucontrol->value.enumerated.item[0] = spec->out_enum_val;
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		mutex_lock(&spec->ae9_output_mutex);
+		ucontrol->value.enumerated.item[0] = spec->out_enum_val;
+		mutex_unlock(&spec->ae9_output_mutex);
+	} else {
+		ucontrol->value.enumerated.item[0] = spec->out_enum_val;
+	}
 	return 0;
 }
 
@@ -6292,6 +6335,21 @@ static int ca0132_alt_output_select_put(struct snd_kcontrol *kcontrol,
 
 	codec_dbg(codec, "ca0132_alt_output_select: sel=%d, preset=%s\n",
 		    sel, out_type_str[sel]);
+
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		int err = 0;
+
+		CLASS(snd_hda_power_pm, pm)(codec);
+
+		mutex_lock(&spec->ae9_output_mutex);
+		auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
+		if (!auto_jack)
+			err = ae9_select_output_locked(codec, sel);
+		else
+			spec->out_enum_val = sel;
+		mutex_unlock(&spec->ae9_output_mutex);
+		return err < 0 ? err : 1;
+	}
 
 	spec->out_enum_val = sel;
 
@@ -9329,7 +9387,7 @@ static void ae9_acm_setreg(struct ca0132_spec *spec, u8 reg, u8 val, u8 mask)
 	ae9_acm_cmd(spec, f, sizeof(f));
 }
 
-/* F0 83 01 <reg> F7 -> RX 6: [4] = value (Windows 0x3f494 "items"); -1 on no reply */
+/* F0 83 01 <reg> F7 -> F0 83 02 <reg> <value> F7 on ACM fw 0x019589c8. */
 static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
 {
 	u8 q[5] = { 0xf0, 0x83, 0x01, reg, 0xf7 };
@@ -9338,8 +9396,13 @@ static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
 
 	ae9_acm_tx(spec, q, sizeof(q));
 	n = ae9_acm_rx(spec, rx, 6, 100);
-	if (n < 5 || rx[0] != 0xf0)
-		return -1;
+	if (n != 6 || rx[0] != 0xf0 || rx[1] != 0x83 || rx[2] != 2 ||
+	    rx[3] != reg || rx[5] != 0xf7) {
+		codec_info(spec->codec,
+			   "AE-9 ACM: invalid register reply reg=%02x len=%d bytes=%*ph\n",
+			   reg, n, n, rx);
+		return -EIO;
+	}
 	return rx[4];
 }
 
@@ -9584,21 +9647,70 @@ static void ae9_acm_apply_mode(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	mutex_lock(&spec->ae9_output_mutex);
+	spec->ae9_acm_pending_mode = false;
 	ae9_acm_apply_regs(spec);
 	ae9_apply_output_path(codec);
 	ae9_acm_display(spec, spec->cur_out_type == HEADPHONE_OUT ? "-HP-" : "-SP-");
 	spec->ae9_acm_show_mode_ticks = 10;
+	mutex_unlock(&spec->ae9_output_mutex);
 }
 
-/* Every 10th tick (Windows 0x3f494 reads items 2, 1, 7): verify the mode bits
- * and put them back if the module changed them on its own. Logs the drift. */
-/* Every 10th tick (Windows reads items 2/1/7 and 5/6 each tick): make sure the
- * HP-amp bit is what we set, and log the module's own selector bits when they
- * change (Windows follows them; we only report for now). */
+/*
+ * Physical 3.5 mm headphone presence is reg2 bit5, active low. Two unplug /
+ * replug trials on ACM firmware 0x019589c8 changed only this bit. The module's
+ * output-selector bits do not follow that jack. Reuse the existing output
+ * path on the first valid sample and on subsequent physical transitions;
+ * leave manual output choices alone while the jack state stays unchanged.
+ */
+static void ae9_acm_update_headphone_jack(struct hda_codec *codec, int reg2)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct snd_kcontrol *kctl;
+	bool present = !(reg2 & 0x20);
+	bool notify = false;
+	int output = present ? HEADPHONE_OUT : SPEAKER_OUT;
+	int err;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+
+	/* Only the ACM worker updates the physical-presence sample. */
+	if (spec->ae9_hp_jack_valid && present == spec->ae9_hp_jack_present)
+		return;
+
+	kctl = snd_hda_find_mixer_ctl(codec, "AE-9 Output");
+	if (!kctl)
+		return;
+
+	CLASS(snd_hda_power_pm, pm)(codec);
+	mutex_lock(&spec->ae9_output_mutex);
+	spec->ae9_hp_jack_valid = true;
+	spec->ae9_hp_jack_present = present;
+	codec_info(codec, "AE-9 ACM: headphone jack %s (reg2=%02x)\n",
+		   present ? "inserted" : "removed", reg2);
+	if (spec->out_enum_val == output && spec->cur_out_type == output)
+		goto out;
+
+	err = ae9_select_output_locked(codec, output);
+	if (err < 0) {
+		/* Do not retry a partially applied switch on an unchanged jack. */
+		codec_err(codec, "AE-9 ACM: jack output switch failed (%d)\n", err);
+		goto out;
+	}
+
+	notify = true;
+out:
+	mutex_unlock(&spec->ae9_output_mutex);
+	if (notify)
+		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+}
+
+/* Every 10th tick, verify the amp, report the selector and sample the jack. */
 static void ae9_acm_check_regs(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
-	bool hp = spec->cur_out_type == HEADPHONE_OUT;
+	bool hp;
 	int r2 = ae9_acm_getreg(spec, 0x02);
 	int r7 = ae9_acm_getreg(spec, 0x07);
 	int sel;
@@ -9615,11 +9727,15 @@ static void ae9_acm_check_regs(struct hda_codec *codec)
 		spec->ae9_acm_regs_logged = true;
 		spec->ae9_acm_sel = sel;
 	}
+	mutex_lock(&spec->ae9_output_mutex);
+	hp = spec->cur_out_type == HEADPHONE_OUT;
 	if (!!(r2 & 0x40) != hp) {
 		codec_info(codec, "AE-9 ACM: HP amp bit is %s but output is %s, re-applying\n",
 			   (r2 & 0x40) ? "on" : "off", hp ? "headphone" : "speakers");
 		ae9_acm_apply_regs(spec);
 	}
+	mutex_unlock(&spec->ae9_output_mutex);
+	ae9_acm_update_headphone_jack(codec, r2);
 }
 
 static bool ae9_acm_init(struct hda_codec *codec)
@@ -9805,8 +9921,7 @@ static void ae9_acm_work_fn(struct work_struct *work)
 			spec->ae9_acm_dead_ticks = 0;
 		}
 	}
-	if (spec->ae9_acm_pending_mode) {
-		spec->ae9_acm_pending_mode = false;
+	if (READ_ONCE(spec->ae9_acm_pending_mode)) {
 		ae9_acm_apply_mode(codec);
 	} else if (!turbo && (spec->ae9_acm_tick % 10) == 0) {
 		ae9_acm_check_regs(codec);
@@ -11607,6 +11722,7 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		return -ENOMEM;
 	codec->spec = spec;
 	spec->codec = codec;
+	mutex_init(&spec->ae9_output_mutex);
 
 	/* Detect codec quirk */
 	snd_hda_pick_fixup(codec, ca0132_quirk_models, ca0132_quirks, NULL);
@@ -11793,7 +11909,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto2");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
