@@ -70,3 +70,11 @@ La référence essayée est Linux Mint 22.3, XanMod
 les autres noyaux, la capture, la reprise de veille ou les autres cartes.
 Un délai ACM/Mint subsiste et reste en cours de mesure ; aucune modification
 des échanges d'entretien destinée à le réduire n'est incluse.
+
+- `hpauto5-displayui1` : envoi UART dédié à l'affichage et rafraîchissement
+  demandé par les changements de volume/muet dans Mint (échéance de 20 ms,
+  espacement de 50 ms entre envois). Les échanges d'entretien restent
+  prioritaires sur une workqueue unique ; un entretien en cours peut
+  encore retarder l'écran. L'utilisateur a confirmé que l'affichage suit
+  mieux le curseur, avec des retards résiduels observés jusqu'à 696 ms.
+  Cette version n'est pas une validation du micro ou de la capture.

@@ -20,6 +20,9 @@
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
+#include <linux/ktime.h>
+#include <linux/jiffies.h>
+#include <linux/spinlock.h>
 
 /* AE-9 ACM service mode. 0 (default) = initialise the module once (unlock,
  * headphone amp on, display) and then leave it alone: no keepalive, no knob
@@ -1184,7 +1187,19 @@ struct ca0132_spec {
 	struct delayed_work unsol_hp_work;
 	struct delayed_work ae9_dump_work;	/* AE-9: mid-playback DSP/DAC dump */
 	struct delayed_work ae9_acm_work;	/* AE-9: 500 ms ACM service (keepalive, knob, display) */
+	spinlock_t ae9_acm_work_lock;
+	bool ae9_acm_active;
+	bool ae9_acm_removing;
+	bool ae9_acm_busy;
+	bool ae9_acm_ui_only;
+	bool ae9_acm_ui_pending;
+	unsigned long ae9_acm_service_due;
+	unsigned long ae9_acm_ui_due;
+	unsigned long ae9_acm_quiet_until;
+	unsigned int ae9_acm_refresh_log_left;
 	bool ae9_acm_present;
+	unsigned int ae9_acm_display_tx_left; /* diagnostic log budget */
+	bool ae9_acm_display_tx_failed; /* stop the display trial after failure */
 	unsigned int ae9_acm_fw;
 	int ae9_acm_tick;
 	int ae9_acm_show_mode_ticks;	/* >0: "-HP-"/"-SP-" on the display, then revert to volume */
@@ -1257,6 +1272,8 @@ enum {
 #define ca0132_use_pci_mmio(spec)	({ (void)(spec); false; })
 #define ca0132_use_alt_controls(spec)	({ (void)(spec); false; })
 #endif
+
+static void ae9_acm_display_changed(struct ca0132_spec *spec);
 
 static const struct hda_pintbl alienware_pincfgs[] = {
 	{ 0x0b, 0x90170110 }, /* Builtin Speaker */
@@ -6778,7 +6795,7 @@ static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 	guard(mutex)(&codec->control_mutex);
 	err = snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
 	/* A failed stereo put may already have changed one channel. */
-	WRITE_ONCE(spec->ae9_acm_disp_dirty, true);
+	ae9_acm_display_changed(spec);
 	if (err < 0)
 		return err;
 	if (ch & 1)
@@ -7413,7 +7430,7 @@ static void ae9_vmaster_mute_changed(void *private_data, int enabled)
 
 	(void)enabled;
 	/* Refresh from the committed Master state in the ACM worker. */
-	WRITE_ONCE(spec->ae9_acm_disp_dirty, true);
+	ae9_acm_display_changed(spec);
 }
 
 static int ca0132_build_controls(struct hda_codec *codec)
@@ -9353,6 +9370,185 @@ static void ae9_automute_probe(struct hda_codec *codec)
  * Windows driver RE (reference/ctxhda-acm-analysis.md). Everything below runs
  * from the 500 ms service work (Windows' periodic ACM thread); the ALSA
  * control hooks only set flags. ---- */
+#define AE9_ACM_UI_DELAY_MS 20
+#define AE9_ACM_QUIET_MS 50
+
+enum ae9_acm_job {
+	AE9_ACM_JOB_NONE,
+	AE9_ACM_JOB_DISPLAY,
+	AE9_ACM_JOB_SERVICE,
+};
+
+/* Caller holds work_lock. UI activity must never move service_due. */
+static unsigned long ae9_acm_next_work_locked(struct ca0132_spec *spec)
+{
+	unsigned long now = jiffies, due = spec->ae9_acm_service_due;
+	unsigned long ui = spec->ae9_acm_ui_due;
+
+	if (!spec->ae9_acm_ui_pending || !READ_ONCE(ae9_acm_poll) ||
+	    !spec->ae9_acm_present || spec->ae9_acm_show_mode_ticks > 0 ||
+	    READ_ONCE(spec->ae9_acm_pending_mode) ||
+	    spec->ae9_acm_display_tx_failed)
+		return due;
+	if (time_before(ui, spec->ae9_acm_quiet_until))
+		ui = spec->ae9_acm_quiet_until;
+	if (time_before(ui, now))
+		ui = now;
+	/* Preserve a full quiet interval before the next UART service. */
+	if (time_before(ui + msecs_to_jiffies(AE9_ACM_QUIET_MS), due))
+		due = ui;
+	return due;
+}
+
+static void ae9_acm_queue_locked(struct ca0132_spec *spec)
+{
+	unsigned long now, due;
+
+	if (!spec->ae9_acm_active || spec->ae9_acm_busy)
+		return;
+	due = ae9_acm_next_work_locked(spec);
+	now = jiffies;
+	mod_delayed_work(AE9_WQ, &spec->ae9_acm_work,
+			 time_after(due, now) ? due - now : 0);
+}
+
+static void ae9_acm_display_changed(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return;
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	spec->ae9_acm_disp_dirty = true;
+	if (!spec->ae9_acm_ui_pending) {
+		spec->ae9_acm_ui_pending = true;
+		spec->ae9_acm_ui_due = jiffies +
+			msecs_to_jiffies(AE9_ACM_UI_DELAY_MS);
+	}
+	if (READ_ONCE(ae9_acm_poll))
+		ae9_acm_queue_locked(spec);
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
+static bool ae9_acm_take_display(struct ca0132_spec *spec)
+{
+	unsigned long flags, requested;
+	bool dirty, log;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	dirty = spec->ae9_acm_disp_dirty;
+	requested = spec->ae9_acm_ui_due -
+		msecs_to_jiffies(AE9_ACM_UI_DELAY_MS);
+	spec->ae9_acm_disp_dirty = false;
+	spec->ae9_acm_ui_pending = false;
+	log = dirty && spec->ae9_acm_refresh_log_left;
+	if (log)
+		spec->ae9_acm_refresh_log_left--;
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	if (log)
+		codec_info(spec->codec, "AE-9 ACM refresh: request_wait_ms=%u\n",
+			   jiffies_to_msecs(jiffies - requested));
+	return dirty;
+}
+
+static bool ae9_acm_display_allowed(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+	bool allowed;
+
+	/* ALSA state reads may sleep: recheck immediately before the UART TX. */
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	allowed = !spec->ae9_acm_ui_only ||
+		(spec->ae9_acm_active && READ_ONCE(ae9_acm_poll) &&
+		 spec->ae9_acm_present && !spec->ae9_acm_display_tx_failed &&
+		 spec->ae9_acm_show_mode_ticks <= 0 &&
+		 !READ_ONCE(spec->ae9_acm_pending_mode) &&
+		 time_before(jiffies + msecs_to_jiffies(AE9_ACM_QUIET_MS),
+			     spec->ae9_acm_service_due));
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	if (!allowed)
+		ae9_acm_display_changed(spec);
+	return allowed;
+}
+
+static void ae9_acm_start(struct ca0132_spec *spec, unsigned long delay)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	if (!spec->ae9_acm_active && !spec->ae9_acm_removing) {
+		spec->ae9_acm_active = true;
+		spec->ae9_acm_busy = false;
+		spec->ae9_acm_ui_only = false;
+		spec->ae9_acm_service_due = jiffies + delay;
+		spec->ae9_acm_quiet_until = jiffies;
+		ae9_acm_queue_locked(spec);
+	}
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
+static void ae9_acm_stop(struct ca0132_spec *spec, bool removing)
+{
+	unsigned long flags;
+
+	/* Close the callback producer before cancelling the shared work item. */
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	if (removing)
+		spec->ae9_acm_removing = true;
+	spec->ae9_acm_active = false;
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	cancel_delayed_work_sync(&spec->ae9_acm_work);
+}
+
+static void ae9_acm_park(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	spec->ae9_acm_active = false;
+	spec->ae9_acm_busy = false;
+	spec->ae9_acm_ui_only = false;
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
+static enum ae9_acm_job ae9_acm_begin_work(struct ca0132_spec *spec)
+{
+	enum ae9_acm_job job = AE9_ACM_JOB_NONE;
+	unsigned long flags, now;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	now = jiffies;
+	if (spec->ae9_acm_active) {
+		if (!time_before(now, spec->ae9_acm_service_due))
+			job = AE9_ACM_JOB_SERVICE;
+		else if (!time_before(now, ae9_acm_next_work_locked(spec)))
+			job = AE9_ACM_JOB_DISPLAY;
+		if (job != AE9_ACM_JOB_NONE)
+			spec->ae9_acm_busy = true;
+		else
+			ae9_acm_queue_locked(spec);
+		spec->ae9_acm_ui_only = job == AE9_ACM_JOB_DISPLAY;
+	}
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	return job;
+}
+
+static void ae9_acm_finish_work(struct ca0132_spec *spec,
+				unsigned long service_delay)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	if (service_delay)
+		spec->ae9_acm_service_due = jiffies + service_delay;
+	spec->ae9_acm_quiet_until = jiffies +
+		msecs_to_jiffies(AE9_ACM_QUIET_MS);
+	spec->ae9_acm_busy = false;
+	spec->ae9_acm_ui_only = false;
+	ae9_acm_queue_locked(spec);
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
 #define AE9_U_RBR 0xc00
 #define AE9_U_THR 0xc00
 #define AE9_U_DLL 0xc00
@@ -9457,6 +9653,54 @@ static bool ae9_acm_keepalive(struct ca0132_spec *spec)
 	return n >= 8 && rx[0] == 0xf0 && rx[3];
 }
 
+/* Trial only for unacknowledged volume/mute display frames, never keepalive. */
+static void ae9_acm_display_tx(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	void __iomem *b2 = spec->mem_base;
+	unsigned int waits = 0;
+	ktime_t start;
+	u32 status = 0;
+	int i, w;
+
+	if (spec->ae9_acm_display_tx_failed)
+		return;
+	start = ktime_get();
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < n; i++) {
+		for (w = 0; w < 100; w++) {
+			/* CtxHdb tests bit 1 of the full DWORD at BAR2+0xc7c. */
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U)
+				goto failed;
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+			waits++;
+		}
+		if (w == 100)
+			goto failed;
+		writeb(p[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+	if (spec->ae9_acm_display_tx_left) {
+		spec->ae9_acm_display_tx_left--;
+		codec_info(spec->codec,
+			   "AE-9 ACM display TX: sent=%d/%d waits=%u duration_us=%lld status=%08x logs_left=%u\n",
+			   i, n, waits,
+			   (long long)ktime_us_delta(ktime_get(), start), status,
+			   spec->ae9_acm_display_tx_left);
+	}
+	return;
+
+failed:
+	/* Do not send an unready byte or retry a partially transmitted frame. */
+	spec->ae9_acm_display_tx_failed = true;
+	codec_warn(spec->codec,
+		   "AE-9 ACM display TX: FAILED sent=%d/%d waits=%u status=%08x; volume display trial stopped until reboot\n",
+		   i, n, waits, status);
+}
+
 /* F0 11 09 <8 ASCII, NUL padded> 00 F7 : display text */
 static void ae9_acm_display_frame(struct ca0132_spec *spec, const char *txt, bool wait)
 {
@@ -9467,6 +9711,8 @@ static void ae9_acm_display_frame(struct ca0132_spec *spec, const char *txt, boo
 		f[3 + i] = txt[i];
 	if (wait)
 		ae9_acm_cmd(spec, f, sizeof(f));
+	else if (ca0132_quirk(spec) == QUIRK_AE9)
+		ae9_acm_display_tx(spec, f, sizeof(f));
 	else
 		ae9_acm_tx(spec, f, sizeof(f));	/* fire and forget: volume display */
 }
@@ -9544,7 +9790,7 @@ static void ae9_acm_show_volume(struct ca0132_spec *spec)
 		}
 		caps = query_amp_caps(codec, 0x02, HDA_OUTPUT);
 		if (left < 0 || right < 0 || caps == ~0U) {
-			WRITE_ONCE(spec->ae9_acm_disp_dirty, true);
+			ae9_acm_display_changed(spec);
 			return;
 		}
 		offset = (caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT;
@@ -9555,6 +9801,8 @@ static void ae9_acm_show_volume(struct ca0132_spec *spec)
 		snprintf(txt, sizeof(txt), "%s%d.%d", db100 < 0 ? "-" : "",
 			 abs(db100) / 100, (abs(db100) % 100) / 10);
 	}
+	if (!ae9_acm_display_allowed(spec))
+		return;
 	ae9_acm_display_frame(spec, txt, false);
 }
 
@@ -9650,7 +9898,7 @@ static void ae9_acm_service_knob_press(struct hda_codec *codec)
 	if (ms < 1500) {
 		ae9_toggle_ctl(codec, "Master Playback Switch", false);
 		codec_info(codec, "AE-9 ACM: knob press (%d ms) -> mute toggle\n", ms);
-		spec->ae9_acm_disp_dirty = true;
+		ae9_acm_display_changed(spec);
 	} else if (ms < 3000) {
 		ae9_toggle_ctl(codec, "AE-9 Output", true);	/* select_out flags pending_mode */
 		codec_info(codec, "AE-9 ACM: knob mid press (%d ms) -> output toggle\n", ms);
@@ -9931,7 +10179,7 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	if (n <= 0)
 		return;
 	snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
-	spec->ae9_acm_disp_dirty = true;
+	ae9_acm_display_changed(spec);
 }
 
 /* The 500 ms ACM service (Windows: thread 0x413b4; 50 ms "turbo" while the
@@ -9942,6 +10190,16 @@ static void ae9_acm_work_fn(struct work_struct *work)
 						struct ca0132_spec, ae9_acm_work);
 	struct hda_codec *codec = spec->codec;
 	bool turbo = spec->ae9_acm_turbo > 0;
+	enum ae9_acm_job job = ae9_acm_begin_work(spec);
+
+	if (job == AE9_ACM_JOB_NONE)
+		return;
+	if (job == AE9_ACM_JOB_DISPLAY) {
+		if (ae9_acm_take_display(spec))
+			ae9_acm_show_volume(spec);
+		ae9_acm_finish_work(spec, 0);
+		return;
+	}
 
 	ae9_gpio_cmd(spec, 0x0105);
 	if (!spec->ae9_acm_present) {
@@ -9950,13 +10208,16 @@ static void ae9_acm_work_fn(struct work_struct *work)
 			if (spec->ae9_acm_present && !ae9_acm_poll) {
 				ae9_acm_show_volume(spec);
 				codec_info(codec, "AE-9 ACM: initialised; service parked (ae9_acm_poll=0)\n");
+				ae9_acm_park(spec);
 				return;		/* no reschedule: quiet baseline */
 			}
 		}
 		goto out;
 	}
-	if (!ae9_acm_poll)
+	if (!ae9_acm_poll) {
+		ae9_acm_park(spec);
 		return;			/* parked at runtime via /sys/module/.../parameters */
+	}
 	spec->ae9_acm_tick++;
 	/*
 	 * While the knob is moving only the knob and the display are serviced.
@@ -9994,17 +10255,16 @@ static void ae9_acm_work_fn(struct work_struct *work)
 	}
 	if (spec->ae9_acm_show_mode_ticks > 0) {
 		if (--spec->ae9_acm_show_mode_ticks == 0)
-			spec->ae9_acm_disp_dirty = true;
-	} else if (spec->ae9_acm_disp_dirty) {
-		spec->ae9_acm_disp_dirty = false;
+			ae9_acm_display_changed(spec);
+	} else if (ae9_acm_take_display(spec)) {
 		ae9_acm_show_volume(spec);
 	}
 out:
 	if (spec->ae9_acm_turbo > 0) {
 		spec->ae9_acm_turbo--;
-		queue_delayed_work(AE9_WQ, &spec->ae9_acm_work, msecs_to_jiffies(50));
+		ae9_acm_finish_work(spec, msecs_to_jiffies(50));
 	} else {
-		queue_delayed_work(AE9_WQ, &spec->ae9_acm_work, msecs_to_jiffies(500));
+		ae9_acm_finish_work(spec, msecs_to_jiffies(500));
 	}
 }
 
@@ -10089,7 +10349,7 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	codec_info(codec, "AE-9: converter bring-up done (capture-based, OutFX %s)\n",
 		   spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] ? "on" : "off");
 	ae9_dump_dsp_output_state(codec, "idle after bring-up");
-	queue_delayed_work(AE9_WQ, &spec->ae9_acm_work, msecs_to_jiffies(500));
+	ae9_acm_start(spec, msecs_to_jiffies(500));
 }
 
 static void ae7_setup_defaults(struct hda_codec *codec)
@@ -11283,8 +11543,7 @@ static int ca0132_init(struct hda_codec *codec)
 			if (ca0132_quirk(spec) == QUIRK_SBZ)
 				sbz_dsp_startup_check(codec);
 			if (ca0132_quirk(spec) == QUIRK_AE9)
-				queue_delayed_work(AE9_WQ, &spec->ae9_acm_work,
-						      msecs_to_jiffies(500));
+				ae9_acm_start(spec, msecs_to_jiffies(500));
 			return 0;
 		}
 	}
@@ -11403,7 +11662,7 @@ static void ca0132_free(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	cancel_delayed_work_sync(&spec->ae9_dump_work);
-	cancel_delayed_work_sync(&spec->ae9_acm_work);
+	ae9_acm_stop(spec, true);
 	snd_hda_power_up(codec);
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
@@ -11780,6 +12039,7 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 	codec->spec = spec;
 	spec->codec = codec;
 	mutex_init(&spec->ae9_output_mutex);
+	spin_lock_init(&spec->ae9_acm_work_lock);
 
 	/* Detect codec quirk */
 	snd_hda_pick_fixup(codec, ca0132_quirk_models, ca0132_quirks, NULL);
@@ -11871,10 +12131,18 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 
 #ifdef CONFIG_PCI
 	if (spec->use_pci_mmio) {
-		spec->mem_base = pci_iomap(codec->bus->pci, 2, 0xC20);
+		unsigned long map_size = 0xc20;
+
+		/* Include the full DWORD status register on the AE-9 only. */
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			map_size = AE9_U_STS + sizeof(u32);
+		spec->mem_base = pci_iomap(codec->bus->pci, 2, map_size);
 		if (spec->mem_base == NULL) {
 			codec_warn(codec, "pci_iomap failed! Setting quirk to QUIRK_NONE.");
 			codec->fixup_id = QUIRK_NONE;
+		} else if (ca0132_quirk(spec) == QUIRK_AE9) {
+			spec->ae9_acm_display_tx_left = 32;
+			spec->ae9_acm_refresh_log_left = 32;
 		}
 	}
 #endif
@@ -11943,7 +12211,7 @@ static int ca0132_codec_suspend(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	cancel_delayed_work_sync(&spec->ae9_dump_work);
-	cancel_delayed_work_sync(&spec->ae9_acm_work);
+	ae9_acm_stop(spec, false);
 	spec->ae9_acm_present = false;	/* re-probe the ACM after resume */
 	return 0;
 }
@@ -11969,7 +12237,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
