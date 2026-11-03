@@ -1201,6 +1201,7 @@ struct ca0132_spec {
 	unsigned int ae9_acm_display_tx_left; /* diagnostic log budget */
 	bool ae9_acm_display_tx_failed; /* stop the display trial after failure */
 	bool ae9_acm_knob_tx_failed; /* stop the knob TX trial after failure */
+	bool ae9_acm_button_tx_failed; /* stop the button TX trial after failure */
 	unsigned int ae9_acm_fw;
 	int ae9_acm_tick;
 	int ae9_acm_show_mode_ticks;	/* >0: "-HP-"/"-SP-" on the display, then revert to volume */
@@ -9610,6 +9611,44 @@ failed:
 	return false;
 }
 
+/* Trial only for B1 button queries; keep maintenance and C2 unchanged. */
+static bool ae9_acm_button_tx(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	void __iomem *b2 = spec->mem_base;
+	u32 status = 0;
+	int i, w;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_button_tx_failed)
+		return false;
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < n; i++) {
+		for (w = 0; w < 100; w++) {
+			/* Use the DWORD TX-ready test validated for display/C2. */
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U)
+				goto failed;
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+		}
+		if (w == 100)
+			goto failed;
+		writeb(p[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+	return true;
+
+failed:
+	/* Never continue or resend a partially transmitted frame. */
+	spec->ae9_acm_button_tx_failed = true;
+	codec_warn(spec->codec,
+		   "AE-9 ACM button TX: FAILED sent=%d/%d status=%08x; "
+		   "button queries stopped, restore previous codec\n",
+		   i, n, status);
+	return false;
+}
+
 static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait_ms)
 {
 	void __iomem *b2 = spec->mem_base;
@@ -9871,7 +9910,8 @@ static int ae9_acm_button(struct ca0132_spec *spec, int n)
 	u8 rx[8];
 	int got;
 
-	ae9_acm_tx(spec, q, sizeof(q));
+	if (!ae9_acm_button_tx(spec, q, sizeof(q)))
+		return 0;
 	got = ae9_acm_rx(spec, rx, sizeof(rx), 30);
 	if (got < 5 || rx[0] != 0xf0 || rx[3] != n || rx[4] != 1)
 		return 0;
@@ -12276,7 +12316,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

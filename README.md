@@ -93,3 +93,12 @@ des échanges d'entretien destinée à le réduire n'est incluse.
   confirmé par l'utilisateur. Ce temps de fonction n'est pas une mesure du
   délai entre le mouvement physique et l'affichage. Les délais programmés
   restent inchangés ; la cadence réelle peut avancer avec le worker raccourci.
+
+- `buttontx1` : émetteur borné distinct pour les requêtes boutons B1,
+  avec arrêt avant réception après échec TX. Sur l'essai : 66 réponses B1
+  conformes, requêtes d'environ 53 → 1,4–1,5 ms et 500 → 0 attentes TX.
+  Au repos, sous les mêmes sondes, le worker passe de 2,13 à 1,88 % d'un
+  cœur et de 4 598 à 3 952 réveils/s par rapport à `knobtx1` : un relevé
+  comparatif, sans preuve d'économie électrique ni de latence physique.
+  Les appuis physiques et la stabilité prolongée ne sont pas qualifiés par
+  la seule observation de réponses B1 au repos.
