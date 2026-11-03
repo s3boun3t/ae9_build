@@ -85,3 +85,11 @@ des échanges d'entretien destinée à le réduire n'est incluse.
   aux autres cartes ; leur campagne matérielle de non-régression reste à
   faire. Le cœur `4976E15962035D24EDB04AA` a été utilisé sur la machine de
   référence sans `iommu=pt`, avec un domaine `DMA-FQ`.
+
+- `knobtx1` : émetteur borné propre aux requêtes de molette C2, utilisant
+  le statut DWORD à `BAR2+0xC7C`. Un échec arrête ce chemin, sans réémettre
+  une trame partielle. Sur l'essai instrumenté, durée moyenne de la requête
+  au repos : environ 42,5 → 1,54 ms ; 61 réponses C2 vérifiées. Le son est
+  confirmé par l'utilisateur. Ce temps de fonction n'est pas une mesure du
+  délai entre le mouvement physique et l'affichage. Les délais programmés
+  restent inchangés ; la cadence réelle peut avancer avec le worker raccourci.

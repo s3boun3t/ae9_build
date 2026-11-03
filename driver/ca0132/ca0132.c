@@ -1200,6 +1200,7 @@ struct ca0132_spec {
 	bool ae9_acm_present;
 	unsigned int ae9_acm_display_tx_left; /* diagnostic log budget */
 	bool ae9_acm_display_tx_failed; /* stop the display trial after failure */
+	bool ae9_acm_knob_tx_failed; /* stop the knob TX trial after failure */
 	unsigned int ae9_acm_fw;
 	int ae9_acm_tick;
 	int ae9_acm_show_mode_ticks;	/* >0: "-HP-"/"-SP-" on the display, then revert to volume */
@@ -9572,6 +9573,43 @@ static void ae9_acm_tx(struct ca0132_spec *spec, const u8 *p, int n)
 	}
 }
 
+/* Trial only for knob queries; keep the generic maintenance TX unchanged. */
+static bool ae9_acm_knob_tx(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	void __iomem *b2 = spec->mem_base;
+	u32 status = 0;
+	int i, w;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_knob_tx_failed)
+		return false;
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < n; i++) {
+		for (w = 0; w < 100; w++) {
+			/* Validate the display TX-ready bit for this query too. */
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U)
+				goto failed;
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+		}
+		if (w == 100)
+			goto failed;
+		writeb(p[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+	return true;
+
+failed:
+	/* Never continue or blindly resend a partially transmitted frame. */
+	spec->ae9_acm_knob_tx_failed = true;
+	codec_warn(spec->codec,
+		   "AE-9 ACM knob TX: FAILED sent=%d/%d status=%08x; knob polling stopped until reboot\n",
+		   i, n, status);
+	return false;
+}
+
 static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait_ms)
 {
 	void __iomem *b2 = spec->mem_base;
@@ -10144,7 +10182,8 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	int n, dir, steps, delta;
 	long v, max_level;
 
-	ae9_acm_tx(spec, q, sizeof(q));
+	if (!ae9_acm_knob_tx(spec, q, sizeof(q)))
+		return;
 	n = ae9_acm_rx(spec, rx, 8, 30);
 	if (n < 5 || rx[0] != 0xf0)
 		return;
@@ -12237,7 +12276,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
