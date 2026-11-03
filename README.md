@@ -64,7 +64,7 @@ autres périphériques audio. La capture AE-9 reste désactivée par défaut.
   l'accord au maximum avec Mint et les points intermédiaires ; −90 dB
   correspond à environ 3,2 %, le muet restant distinct.
 
-La référence essayée est Linux Mint 22.3, XanMod
+Référence historique de `hpauto5` : Linux Mint 22.3, XanMod
 `7.2.14-x64v3-xanmod1`, avec `iommu=pt`,
 `ae9_capture=0`, `ae9_mic=0` et `ae9_acm_poll=1`. Cela ne qualifie pas
 les autres noyaux, la capture, la reprise de veille ou les autres cartes.
@@ -78,3 +78,10 @@ des échanges d'entretien destinée à le réduire n'est incluse.
   encore retarder l'écran. L'utilisateur a confirmé que l'affichage suit
   mieux le curseur, avec des retards résiduels observés jusqu'à 696 ms.
   Cette version n'est pas une validation du micro ou de la capture.
+
+- `pci1` (cœur HDA) : les quatre lectures de vidage ajoutées par la base
+  DarkNikGr sont réservées au contrôleur PCI `1102:0010`, sous-système
+  `1102:0071`. Aucun champ partagé n'est ajouté. Le cœur HDA reste commun
+  aux autres cartes ; leur campagne matérielle de non-régression reste à
+  faire. Le cœur `4976E15962035D24EDB04AA` a été utilisé sur la machine de
+  référence sans `iommu=pt`, avec un domaine `DMA-FQ`.
