@@ -41,12 +41,10 @@ static bool ae9_out_mute = true;
 module_param(ae9_out_mute, bool, 0644);
 MODULE_PARM_DESC(ae9_out_mute, "AE-9: mute the unselected output when switching headphone/line-out (default 1)");
 
-/* The AE-9 main codec's capture path runs through the DSP and is not brought
- * up; starting a capture stream there hard-locks the machine (2026-09-09: an
- * application fell back to the card's analog capture when a USB microphone
- * was unplugged; the box froze without a kernel message). The secondary codec
- * (0x11020072) has a plain HDA ADC behind the rear line-in and S/PDIF in and
- * is safe to expose. ae9_capture=1 lifts the block on the main codec. */
+/* The AE-9 main codec captures through the DSP and requires microphone setup.
+ * Enable both by default; explicit module options can still disable either.
+ * The secondary codec's standard ADC capture remains independent.
+ */
 /* 6.18+ renamed the unbound system workqueue; 7.x warns on the old name. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
 #define AE9_WQ system_dfl_wq
@@ -54,17 +52,16 @@ MODULE_PARM_DESC(ae9_out_mute, "AE-9: mute the unselected output when switching 
 #define AE9_WQ system_unbound_wq
 #endif
 
-static bool ae9_capture;
+static bool ae9_capture = true;
 module_param(ae9_capture, bool, 0444);
-MODULE_PARM_DESC(ae9_capture, "AE-9: expose capture streams on the MAIN codec (DSP input); the secondary codec's standard ADC capture is always exposed and the main one hard-locks the machine unless ae9_mic=1 too (default 0)");
+MODULE_PARM_DESC(ae9_capture,
+		 "AE-9: expose main-codec DSP capture (default 1, needs ae9_mic=1)");
 
-/* Bring up the DSP microphone path. The AE-9-specific port writes are already
- * in ca0132_alt_dsp_initial_mic_setup(); ae9_setup_defaults grew out of the
- * playback trace and never called it. Off by default until the capture stream
- * is proven safe on the card. */
-static bool ae9_mic;
+/* Bring up the existing AE-9 DSP microphone path by default. */
+static bool ae9_mic = true;
 module_param(ae9_mic, bool, 0444);
-MODULE_PARM_DESC(ae9_mic, "AE-9: initialise the DSP mic path (experimental, default 0)");
+MODULE_PARM_DESC(ae9_mic,
+		 "AE-9: initialise the DSP microphone path (default 1)");
 #include <asm/io.h>
 #include <sound/core.h>
 #include <sound/hda_codec.h>
@@ -12316,7 +12313,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

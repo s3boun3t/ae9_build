@@ -34,7 +34,8 @@ provenance et leur extraction. Aucun firmware propriétaire n'est redistribué.
 
 L'installation et le chargement des modules demandent une procédure adaptée
 au noyau, avec un module de secours. Le module HDA commun affecte aussi les
-autres périphériques audio. La capture AE-9 reste désactivée par défaut.
+autres périphériques audio. La capture et le micro AE-9 sont activés par défaut depuis `micdefault1` ;
+les paramètres `ae9_capture=0` ou `ae9_mic=0` bloquent la capture principale.
 
 ## Versions
 
@@ -102,3 +103,20 @@ des échanges d'entretien destinée à le réduire n'est incluse.
   comparatif, sans preuve d'économie électrique ni de latence physique.
   Les appuis physiques et la stabilité prolongée ne sont pas qualifiés par
   la seule observation de réponses B1 au repos.
+
+- `micdefault1` : initialise le micro DSP et expose la capture principale
+  par défaut (`ae9_mic=1`, `ae9_capture=1`). Désactiver explicitement l'un
+  des deux paramètres continue de bloquer la capture principale. Les corps
+  des fonctions et les optimisations ACM restent identiques à `buttontx1`.
+
+La combinaison `pci1` + `knobtx1` + `buttontx1` + `micdefault1` a été essayée
+sur Linux Mint 22.3 / XanMod `7.2.14-x64v3-xanmod1`, sans `iommu=pt`, avec
+`ae9_capture=1`, `ae9_mic=1` et `ae9_acm_poll=1`. L'utilisateur confirme un
+vocal Discord fonctionnel au casque-micro ACM. Les 180 relevés montrent des
+compteurs ERR à 0 pour le micro et les flux Discord, et un compteur lecture
+à 1 dès le premier relevé actif, ensuite stable ; sa cause est indéterminée.
+Aucun nouveau message noyau n'est apparu pendant ce relevé. Les gels signalés
+ailleurs ne sont pas expliqués par cet essai ; plusieurs heures, plusieurs
+démarrages, les autres cartes, noyaux et sorties restent à qualifier.
+Les règles locales de session utilisées pour cet essai ne sont pas installées
+par ce dépôt.
