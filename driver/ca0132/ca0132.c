@@ -12700,8 +12700,11 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 	snd_hda_pick_fixup(codec, ca0132_quirk_models, ca0132_quirks, NULL);
 	if (ca0132_quirk(spec) == QUIRK_SBZ)
 		sbz_detect_quirk(codec);
-	if (ca0132_quirk(spec) == QUIRK_AE9) {
+	if (ca0132_quirk(spec) == QUIRK_AE9)
 		ae9_detect_quirk(codec);
+
+	/* The secondary may have been reclassified as DBPro above. */
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
 		/* Desktop card that is never idle on Windows: runtime D3 cancels
 		 * the ACM service (knob/display) and the resume path returns from
 		 * ca0132_init before restarting it (DSP still loaded). Hold a
@@ -12891,7 +12894,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

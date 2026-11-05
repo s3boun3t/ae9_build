@@ -135,3 +135,5 @@ personnels ne sont pas distribués.
 - `acmfix1` : Vérifier enveloppe, opcode, taille, direction et terminaison des réponses ACM avant toute action ALSA. Préserver les octets F7 présents dans les données.
 
 - `filterfix1` : Exposer les sept filtres ES9038Q2M valides et préserver la consigne lors des changements de sortie et de muet.
+
+- `pmfix1` : Terminer la détection avant de prendre le maintien PM, afin de ne pas attribuer la référence AE-9 au codec secondaire DBPro.
