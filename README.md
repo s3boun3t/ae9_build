@@ -120,3 +120,12 @@ ailleurs ne sont pas expliqués par cet essai ; plusieurs heures, plusieurs
 démarrages, les autres cartes, noyaux et sorties restent à qualifier.
 Les règles locales de session utilisées pour cet essai ne sont pas installées
 par ce dépôt.
+
+## Corrections de l’audit
+
+Cette série conserve le diagnostic opt-in `clockdiag3` dans un prérequis
+séparé, car il était activé pendant les essais matériels de référence.
+Sa valeur par défaut reste zéro. Les scripts de mesure et les outils
+personnels ne sont pas distribués.
+
+- `clockdiag3` : Conserver séparément le diagnostic opt-in employé par les variantes réellement essayées. Désactivé par défaut, il ne corrige ni ne reprogramme les fréquences audio.
