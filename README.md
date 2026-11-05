@@ -145,3 +145,12 @@ personnels ne sont pas distribués.
 - `cleanup1` : Corriger les commentaires de configuration et les noms trompeurs sans modifier les transactions matérielles.
 
 - `refactor1` : Regrouper les couples registre/valeur, les trames communes et les fonctions ACM. Conserver ordre, répétitions, valeurs et temporisations.
+
+- `headerfix1` : Regrouper les inclusions et séparer constantes, compatibilité workqueue et paramètres. Corriger les commentaires capture et sourdine sans changer les fonctions.
+
+Les contrôles de cette adaptation comprennent compilation et simulations sur
+XanMod 7.2.14. Les sources finales sont identiques aux variantes de l’audit essayées sur
+la machine de référence, avec diagnostic activé. Ces observations ne
+constituent pas une qualification universelle. Les appuis limites, autres cartes, autres noyaux
+et la veille/reprise ne sont pas universellement qualifiés. Le correctif
+UART de maintenance encore en étude n’est pas inclus.

@@ -25,63 +25,6 @@
 #include <linux/spinlock.h>
 #include <linux/unaligned.h>
 
-/*
- * AE-9 ACM service mode. 1 (default) enables live knob, display, button
- * and keepalive service. 0 initialises the ACM once, then parks service.
- * The worker schedules service, display and optional clock diagnostics;
- * this is not an unconditional 500 ms register-polling loop.
- */
-static int ae9_acm_poll = 1;
-module_param(ae9_acm_poll, int, 0644);
-MODULE_PARM_DESC(ae9_acm_poll, "AE-9 ACM: 1 = live knob/display/button service (default), 0 = init once and stay quiet");
-
-/* Mute the line-out that is not selected so AE-9 Output is a real switch:
- * the ES9038 front mute (reg 0x1d) for Headphone, the ACM amp bit for
- * Speakers. Set to 0 to restore the old behaviour where both outputs can be
- * audible at once. */
-static bool ae9_out_mute = true;
-module_param(ae9_out_mute, bool, 0644);
-MODULE_PARM_DESC(ae9_out_mute, "AE-9: mute the unselected output when switching headphone/line-out (default 1)");
-
-/* The AE-9 main codec captures through the DSP and requires microphone setup.
- * Enable both by default; explicit module options can still disable either.
- * The secondary codec's standard ADC capture remains independent.
- */
-/* 6.18+ renamed the unbound system workqueue; 7.x warns on the old name. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-#define AE9_WQ system_dfl_wq
-#else
-#define AE9_WQ system_unbound_wq
-#endif
-
-static bool ae9_capture = true;
-module_param(ae9_capture, bool, 0444);
-MODULE_PARM_DESC(ae9_capture,
-		 "AE-9: expose main-codec DSP capture (default 1, needs ae9_mic=1)");
-
-/* Bring up the existing AE-9 DSP microphone path by default. */
-static bool ae9_mic = true;
-module_param(ae9_mic, bool, 0444);
-MODULE_PARM_DESC(ae9_mic,
-		 "AE-9: initialise the DSP microphone path (default 1)");
-
-/* Experimental transport reads; never enabled by the normal audio path. */
-static bool ae9_clock_diag;
-module_param(ae9_clock_diag, bool, 0444);
-MODULE_PARM_DESC(ae9_clock_diag,
-		 "AE-9: opt-in DAC clock snapshots in ACM idle slots (default 0)");
-
-#define AE9_CLOCK_READ_MS 100
-#define AE9_CLOCK_GAP_MS 100
-#define AE9_CLOCK_DELAY_MS 1000
-#define AE9_CLOCK_TIMEOUT_MS 15000
-#define AE9_CLOCK_REG_COUNT 9
-#define AE9_CLOCK_PMU_COUNT 7
-#define AE9_CLOCK_SYS_BEFORE 8
-#define AE9_CLOCK_DAC_FIRST 9
-#define AE9_CLOCK_SYS_AFTER 18
-#define AE9_CLOCK_STEP_COUNT 20
-#define AE9_CLOCK_FLAGS_ID 0x100
 #include <asm/io.h>
 #include <sound/core.h>
 #include <sound/hda_codec.h>
@@ -143,6 +86,69 @@ MODULE_FIRMWARE(EFX_FILE);
 MODULE_FIRMWARE(DESKTOP_EFX_FILE);
 MODULE_FIRMWARE(R3DI_EFX_FILE);
 #endif
+
+/* AE-9 clock diagnostic limits and snapshot layout. */
+#define AE9_CLOCK_READ_MS	100
+#define AE9_CLOCK_GAP_MS	100
+#define AE9_CLOCK_DELAY_MS	1000
+#define AE9_CLOCK_TIMEOUT_MS	15000
+#define AE9_CLOCK_REG_COUNT	9
+#define AE9_CLOCK_PMU_COUNT	7
+#define AE9_CLOCK_SYS_BEFORE	8
+#define AE9_CLOCK_DAC_FIRST	9
+#define AE9_CLOCK_SYS_AFTER	18
+#define AE9_CLOCK_STEP_COUNT	20
+#define AE9_CLOCK_FLAGS_ID	0x100
+
+/* Compatibility name for the unbound system workqueue used by AE-9. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#define AE9_WQ system_dfl_wq
+#else
+#define AE9_WQ system_unbound_wq
+#endif
+
+/* AE-9 module parameters. */
+/*
+ * AE-9 ACM service mode. 1 (default) enables live knob, display, button
+ * and keepalive service. 0 initialises the ACM once, then parks service.
+ * The worker schedules service, display and optional clock diagnostics;
+ * this is not an unconditional 500 ms register-polling loop.
+ */
+static int ae9_acm_poll = 1;
+module_param(ae9_acm_poll, int, 0644);
+MODULE_PARM_DESC(ae9_acm_poll,
+		 "AE-9 ACM: 1 = live knob/display/button service (default), 0 = init once and stay quiet");
+
+/*
+ * Apply ES9038 front/line-out mute for the selected AE-9 output.
+ * Disabling skips DAC writes; ACM headphone-amp selection stays independent.
+ */
+static bool ae9_out_mute = true;
+module_param(ae9_out_mute, bool, 0644);
+MODULE_PARM_DESC(ae9_out_mute,
+		 "AE-9: mute the unselected output when switching headphone/line-out (default 1)");
+
+/*
+ * The AE-9 main codec captures through the DSP and requires microphone setup.
+ * Enable both by default; explicit module options can still disable either.
+ * The secondary codec's standard ADC capture remains independent.
+ */
+static bool ae9_capture = true;
+module_param(ae9_capture, bool, 0444);
+MODULE_PARM_DESC(ae9_capture,
+		 "AE-9: expose main-codec DSP capture (default 1, needs ae9_mic=1)");
+
+/* Bring up the existing AE-9 DSP microphone path by default. */
+static bool ae9_mic = true;
+module_param(ae9_mic, bool, 0444);
+MODULE_PARM_DESC(ae9_mic,
+		 "AE-9: initialise the DSP microphone path (default 1)");
+
+/* Opt-in transport reads scheduled during ACM service idle slots. */
+static bool ae9_clock_diag;
+module_param(ae9_clock_diag, bool, 0444);
+MODULE_PARM_DESC(ae9_clock_diag,
+		 "AE-9: opt-in DAC clock snapshots in ACM idle slots (default 0)");
 
 static const char *const dirstr[2] = { "Playback", "Capture" };
 
@@ -13345,7 +13351,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
