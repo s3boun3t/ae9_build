@@ -131,3 +131,5 @@ personnels ne sont pas distribués.
 - `clockdiag3` : Conserver séparément le diagnostic opt-in employé par les variantes réellement essayées. Désactivé par défaut, il ne corrige ni ne reprogramme les fréquences audio.
 
 - `dead` : Supprimer le diagnostic différé jamais planifié et son état privé. Le dump actif de démarrage reste présent.
+
+- `acmfix1` : Vérifier enveloppe, opcode, taille, direction et terminaison des réponses ACM avant toute action ALSA. Préserver les octets F7 présents dans les données.

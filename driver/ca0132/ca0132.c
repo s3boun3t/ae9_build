@@ -9998,6 +9998,37 @@ failed:
 		   seq, reg, ret, raw);
 }
 
+/* Match a complete reply before interpreting its command-specific payload. */
+static bool ae9_acm_reply_valid(const u8 *rx, int n, u8 cmd, u8 payload_len)
+{
+	return n == payload_len + 4 && rx[0] == 0xf0 && rx[1] == cmd &&
+		rx[2] == payload_len && rx[n - 1] == 0xf7;
+}
+
+static bool ae9_acm_probe_valid(const u8 *rx, int n)
+{
+	return ae9_acm_reply_valid(rx, n, 0x81, 5) && rx[3] != 0;
+}
+
+static bool ae9_acm_decode_knob(const u8 *rx, int n, int *dir, int *steps)
+{
+	if (!ae9_acm_reply_valid(rx, n, 0xc2, 4) || rx[3] > 1)
+		return false;
+
+	*dir = rx[3];
+	*steps = rx[4];
+	return true;
+}
+
+static int ae9_acm_decode_button(const u8 *rx, int n, int button)
+{
+	if (!ae9_acm_reply_valid(rx, n, 0xb1, 4) || rx[3] != button ||
+	    rx[4] != 1)
+		return 0;
+
+	return max(1, rx[5] | rx[6] << 8);
+}
+
 static void ae9_acm_tx(struct ca0132_spec *spec, const u8 *p, int n)
 {
 	void __iomem *b2 = spec->mem_base;
@@ -10091,7 +10122,7 @@ failed:
 static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait_ms)
 {
 	void __iomem *b2 = spec->mem_base;
-	int n = 0, w;
+	int n = 0, w, frame_len = 0;
 
 	/* Sleeping polls only. The udelay() version of this loop pinned a CPU
 	 * for up to 300 ms per exchange and, with several exchanges per tick,
@@ -10106,7 +10137,10 @@ static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait
 				break;
 		}
 		buf[n++] = readb(b2 + AE9_U_RBR);
-		if (buf[n - 1] == 0xf7)		/* end of sysex frame */
+		if (n == 3 && buf[0] == 0xf0)
+			frame_len = buf[2] + 4;
+		/* Binary payloads can contain F7, including button durations. */
+		if (frame_len ? n == frame_len : buf[n - 1] == 0xf7)
 			break;
 	}
 	return n;
@@ -10166,7 +10200,7 @@ static bool ae9_acm_keepalive(struct ca0132_spec *spec)
 	ae9_acm_cmd(spec, unl2, sizeof(unl2));
 	ae9_acm_cmd(spec, rd, sizeof(rd));
 	ae9_acm_cmd(spec, unl3, sizeof(unl3));
-	return n >= 8 && rx[0] == 0xf0 && rx[3];
+	return ae9_acm_probe_valid(rx, n);
 }
 
 /* Trial only for unacknowledged volume/mute display frames, never keepalive. */
@@ -10352,9 +10386,7 @@ static int ae9_acm_button(struct ca0132_spec *spec, int n)
 	if (!ae9_acm_button_tx(spec, q, sizeof(q)))
 		return 0;
 	got = ae9_acm_rx(spec, rx, sizeof(rx), 30);
-	if (got < 5 || rx[0] != 0xf0 || rx[3] != n || rx[4] != 1)
-		return 0;
-	return got >= 7 ? max(1, rx[5] | rx[6] << 8) : 1;
+	return ae9_acm_decode_button(rx, got, n);
 }
 
 /* The ACM's SBX button toggles Enable OutFX, like Windows does. */
@@ -10611,15 +10643,16 @@ static bool ae9_acm_init(struct hda_codec *codec)
 		codec_info(codec, "AE-9 ACM: probe attempt %d%s -> %d bytes: %*ph\n",
 			   attempt, attempt ? " (after power-cycle)" : "", n,
 			   n > 0 ? min(n, 9) : 0, rx);
-		if (n >= 8 && rx[3])
+		if (ae9_acm_probe_valid(rx, n))
 			break;
 	}
-	if (n < 8 || !rx[3]) {
+	if (!ae9_acm_probe_valid(rx, n)) {
 		codec_info(codec, "AE-9 ACM: not detected (n=%d rx0=%02x LSR=%02x STS=%02x); will retry\n",
 			   n, n ? rx[0] : 0, readb(b2 + AE9_U_LSR), readb(b2 + AE9_U_STS));
 		return false;
 	}
-	spec->ae9_acm_fw = rx[4] | rx[5] << 8 | rx[6] << 16 | rx[7] << 24;
+	spec->ae9_acm_fw = (u32)rx[4] | (u32)rx[5] << 8 |
+			   (u32)rx[6] << 16 | (u32)rx[7] << 24;
 	/* Windows init order (BAR2 capture 2026-09-03, once per session) */
 	ae9_acm_cmd(spec, unl1, sizeof(unl1));
 	ae9_acm_cmd(spec, unl2, sizeof(unl2));
@@ -10664,10 +10697,8 @@ static void ae9_acm_knob(struct hda_codec *codec)
 	if (!ae9_acm_knob_tx(spec, q, sizeof(q)))
 		return;
 	n = ae9_acm_rx(spec, rx, 8, 30);
-	if (n < 5 || rx[0] != 0xf0)
+	if (!ae9_acm_decode_knob(rx, n, &dir, &steps))
 		return;
-	dir = rx[3];
-	steps = rx[4];
 	if (!steps)
 		return;
 	if (spec->ae9_knob_dir != dir) {
@@ -12743,7 +12774,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-auditdead1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
