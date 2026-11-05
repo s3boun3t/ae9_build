@@ -143,3 +143,5 @@ personnels ne sont pas distribués.
 - `shutdownfix1` : Utiliser les DAC, GPIO et flux propres à l’AE-9 pour mettre la carte et l’ACM au repos, sans reprendre les commandes d’arrêt AE-5.
 
 - `cleanup1` : Corriger les commentaires de configuration et les noms trompeurs sans modifier les transactions matérielles.
+
+- `refactor1` : Regrouper les couples registre/valeur, les trames communes et les fonctions ACM. Conserver ordre, répétitions, valeurs et temporisations.

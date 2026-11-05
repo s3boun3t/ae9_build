@@ -9149,6 +9149,11 @@ static void ae5_setup_defaults(struct hda_codec *codec)
  * ES9038 muted and unclocked on this card, so every analog output is silent.
  * Order matters: mute, ASI/PLL, DAC registers, then unmute.
  */
+/* AE-9 hardware command data and DAC/GPIO access. */
+struct ae9_reg_val {
+	unsigned int reg, val;
+};
+
 static void ae9_dac_write(struct hda_codec *codec, unsigned int reg, unsigned int val)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -9214,12 +9219,19 @@ static void ae9_chip_ctrl_725(struct hda_codec *codec)
  */
 static void ae9_apply_8051_reg_sequence(struct hda_codec *codec)
 {
-	static const unsigned int addr[] = { 0x44, 0x43, 0x45, 0x40, 0x42, 0x41, 0x51 };
-	static const unsigned int data[] = { 0xc8, 0xcc, 0xcb, 0xc7, 0xcd, 0xce, 0xdb };
+	static const struct ae9_reg_val seq[] = {
+		{ 0x44, 0xc8 },
+		{ 0x43, 0xcc },
+		{ 0x45, 0xcb },
+		{ 0x40, 0xc7 },
+		{ 0x42, 0xcd },
+		{ 0x41, 0xce },
+		{ 0x51, 0xdb },
+	};
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(addr); i++)
-		chipio_8051_write_pll_pmu(codec, addr[i], data[i]);
+	for (i = 0; i < ARRAY_SIZE(seq); i++)
+		chipio_8051_write_pll_pmu(codec, seq[i].reg, seq[i].val);
 }
 
 /* D0.3: I2SM Start - the AE-9's ASI / PLL / stream setup (96 kHz, 32-bit, 6 ch) */
@@ -9286,19 +9298,35 @@ static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 /* D0.4: ES9038 (I2C 0x48) and the second device (0x49) */
 static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 {
-	static const unsigned int dac_reg[] = {
-		0x0b, 0x04, 0x06, 0x08, 0x1d, 0x0a, 0x0c,
-		0x11, 0x12, 0x13, 0x14, 0x0e, 0x07, 0x0f, 0x10, 0x0a
+	static const struct ae9_reg_val dac_init[] = {
+		{ 0x0b, 0x20 },
+		{ 0x04, 0x00 },
+		{ 0x06, 0x40 },
+		{ 0x08, 0xff },
+		{ 0x1d, 0x40 },
+		{ 0x0a, 0x06 },
+		{ 0x0c, 0x5f },
+		{ 0x11, 0xff },
+		{ 0x12, 0xff },
+		{ 0x13, 0xff },
+		{ 0x14, 0x7f },
+		{ 0x0e, 0x8a },
+		{ 0x07, 0x81 },
+		{ 0x0f, 0x00 },
+		{ 0x10, 0x00 },
+		{ 0x0a, 0x02 },
 	};
-	static const unsigned int dac_val[] = {
-		0x20, 0x00, 0x40, 0xff, 0x40, 0x06, 0x5f,
-		0xff, 0xff, 0xff, 0x7f, 0x8a, 0x81, 0x00, 0x00, 0x02
-	};
-	static const unsigned int d49_reg[] = {
-		0x18, 0x19, 0x1a, 0x1b, 0x00, 0x01, 0x06, 0x07, 0x10, 0x0a
-	};
-	static const unsigned int d49_val[] = {
-		0xff, 0xff, 0x00, 0x70, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x07
+	static const struct ae9_reg_val d49_init[] = {
+		{ 0x18, 0xff },
+		{ 0x19, 0xff },
+		{ 0x1a, 0x00 },
+		{ 0x1b, 0x70 },
+		{ 0x00, 0xff },
+		{ 0x01, 0xff },
+		{ 0x06, 0xff },
+		{ 0x07, 0xff },
+		{ 0x10, 0x7f },
+		{ 0x0a, 0x07 },
 	};
 	unsigned int i;
 
@@ -9308,10 +9336,10 @@ static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 	 * ES9038Q2M power-on defaults are assumed (0x0b=0x00, 0x0e=0x8a,
 	 * 0x07=0x80).
 	 */
-	for (i = 0; i < ARRAY_SIZE(dac_reg); i++)
-		ae9_dac_write(codec, dac_reg[i], dac_val[i]);
-	for (i = 0; i < ARRAY_SIZE(d49_reg); i++)
-		ae9_dev49_write(codec, d49_reg[i], d49_val[i]);
+	for (i = 0; i < ARRAY_SIZE(dac_init); i++)
+		ae9_dac_write(codec, dac_init[i].reg, dac_init[i].val);
+	for (i = 0; i < ARRAY_SIZE(d49_init); i++)
+		ae9_dev49_write(codec, d49_init[i].reg, d49_init[i].val);
 }
 
 /* D0.6 / D0.7: captured GPIO4 command, DAC unmute and THD registers */
@@ -9716,6 +9744,7 @@ enum ae9_acm_job {
 };
 
 /* Caller holds work_lock. UI activity must never move service_due. */
+/* AE-9 ACM scheduling, lifecycle and clock-diagnostic arbitration. */
 static unsigned long ae9_acm_next_ui_work_locked(struct ca0132_spec *spec)
 {
 	unsigned long now = jiffies, due = spec->ae9_acm_service_due;
@@ -10019,6 +10048,7 @@ static void ae9_acm_finish_work(struct ca0132_spec *spec,
 	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
 }
 
+/* AE-9 UART register map and clock-diagnostic transport. */
 #define AE9_U_RBR 0xc00
 #define AE9_U_THR 0xc00
 #define AE9_U_DLL 0xc00
@@ -10336,37 +10366,7 @@ failed:
 		   seq, reg, ret, raw);
 }
 
-/* Match a complete reply before interpreting its command-specific payload. */
-static bool ae9_acm_reply_valid(const u8 *rx, int n, u8 cmd, u8 payload_len)
-{
-	return n == payload_len + 4 && rx[0] == 0xf0 && rx[1] == cmd &&
-		rx[2] == payload_len && rx[n - 1] == 0xf7;
-}
-
-static bool ae9_acm_probe_valid(const u8 *rx, int n)
-{
-	return ae9_acm_reply_valid(rx, n, 0x81, 5) && rx[3] != 0;
-}
-
-static bool ae9_acm_decode_knob(const u8 *rx, int n, int *dir, int *steps)
-{
-	if (!ae9_acm_reply_valid(rx, n, 0xc2, 4) || rx[3] > 1)
-		return false;
-
-	*dir = rx[3];
-	*steps = rx[4];
-	return true;
-}
-
-static int ae9_acm_decode_button(const u8 *rx, int n, int button)
-{
-	if (!ae9_acm_reply_valid(rx, n, 0xb1, 4) || rx[3] != button ||
-	    rx[4] != 1)
-		return 0;
-
-	return max(1, rx[5] | rx[6] << 8);
-}
-
+/* AE-9 UART transports: keep maintenance and trial TX paths distinct. */
 static void ae9_acm_tx(struct ca0132_spec *spec, const u8 *p, int n)
 {
 	void __iomem *b2 = spec->mem_base;
@@ -10457,90 +10457,6 @@ failed:
 	return false;
 }
 
-static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait_ms)
-{
-	void __iomem *b2 = spec->mem_base;
-	int n = 0, w, frame_len = 0;
-
-	/* Sleeping polls only. The udelay() version of this loop pinned a CPU
-	 * for up to 300 ms per exchange and, with several exchanges per tick,
-	 * starved the rest of the system (2026-09-08 freeze, hard reset). */
-	for (w = 0; w < first_wait_ms && !(readb(b2 + AE9_U_LSR) & 0x01); w++)
-		usleep_range(800, 1200);
-	while (n < max) {
-		if (!(readb(b2 + AE9_U_LSR) & 0x01)) {
-			for (w = 0; w < 80 && !(readb(b2 + AE9_U_LSR) & 0x01); w++)
-				usleep_range(200, 300);	/* ~20 ms inter-byte */
-			if (!(readb(b2 + AE9_U_LSR) & 0x01))
-				break;
-		}
-		buf[n++] = readb(b2 + AE9_U_RBR);
-		if (n == 3 && buf[0] == 0xf0)
-			frame_len = buf[2] + 4;
-		/* Binary payloads can contain F7, including button durations. */
-		if (frame_len ? n == frame_len : buf[n - 1] == 0xf7)
-			break;
-	}
-	return n;
-}
-
-static void ae9_acm_cmd(struct ca0132_spec *spec, const u8 *p, int n)
-{
-	u8 ack[16];
-
-	ae9_acm_tx(spec, p, n);
-	ae9_acm_rx(spec, ack, sizeof(ack), 100);
-}
-
-/* F0 03 03 <reg> <value> <mask> F7 : set register bits */
-static void ae9_acm_setreg(struct ca0132_spec *spec, u8 reg, u8 val, u8 mask)
-{
-	u8 f[7] = { 0xf0, 0x03, 0x03, reg, val, mask, 0xf7 };
-
-	ae9_acm_cmd(spec, f, sizeof(f));
-}
-
-/* F0 83 01 <reg> F7 -> F0 83 02 <reg> <value> F7 on ACM fw 0x019589c8. */
-static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
-{
-	u8 q[5] = { 0xf0, 0x83, 0x01, reg, 0xf7 };
-	u8 rx[8];
-	int n;
-
-	ae9_acm_tx(spec, q, sizeof(q));
-	n = ae9_acm_rx(spec, rx, 6, 100);
-	if (n != 6 || rx[0] != 0xf0 || rx[1] != 0x83 || rx[2] != 2 ||
-	    rx[3] != reg || rx[5] != 0xf7) {
-		codec_info(spec->codec,
-			   "AE-9 ACM: invalid register reply reg=%02x len=%d bytes=%*ph\n",
-			   reg, n, n, rx);
-		return -EIO;
-	}
-	return rx[4];
-}
-
-/* Windows sends the probe (F0 81 00 F7) on EVERY service tick as a keepalive
- * (0x3fcd8). Returns true if the module answered. */
-static bool ae9_acm_keepalive(struct ca0132_spec *spec)
-{
-	static const u8 probe[] = { 0xf0, 0x81, 0x00, 0xf7 };
-	static const u8 unl1[]  = { 0xf0, 0x54, 0x04, 'A', 'c', 'm', '1', 0xf7 };
-	static const u8 unl2[]  = { 0xf0, 0x54, 0x04, '1', 'm', 'c', 'A', 0xf7 };
-	static const u8 rd[]    = { 0xf0, 0xd5, 0x03, 0x00, 0x20, 0x04, 0xf7 };
-	static const u8 unl3[]  = { 0xf0, 0x54, 0x04, 0x11, 0x11, 0x11, 0x11, 0xf7 };
-	u8 rx[16];
-	int n;
-
-	/* Windows sends these five every tick (capture: 164-167 each in 164 ticks) */
-	ae9_acm_tx(spec, probe, sizeof(probe));
-	n = ae9_acm_rx(spec, rx, sizeof(rx), 100);
-	ae9_acm_cmd(spec, unl1, sizeof(unl1));
-	ae9_acm_cmd(spec, unl2, sizeof(unl2));
-	ae9_acm_cmd(spec, rd, sizeof(rd));
-	ae9_acm_cmd(spec, unl3, sizeof(unl3));
-	return ae9_acm_probe_valid(rx, n);
-}
-
 /* Trial only for unacknowledged volume/mute display frames, never keepalive. */
 static void ae9_acm_display_tx(struct ca0132_spec *spec, const u8 *p, int n)
 {
@@ -10589,6 +10505,130 @@ failed:
 		   i, n, waits, status);
 }
 
+static int ae9_acm_rx(struct ca0132_spec *spec, u8 *buf, int max, int first_wait_ms)
+{
+	void __iomem *b2 = spec->mem_base;
+	int n = 0, w, frame_len = 0;
+
+	/* Sleeping polls only. The udelay() version of this loop pinned a CPU
+	 * for up to 300 ms per exchange and, with several exchanges per tick,
+	 * starved the rest of the system (2026-09-08 freeze, hard reset). */
+	for (w = 0; w < first_wait_ms && !(readb(b2 + AE9_U_LSR) & 0x01); w++)
+		usleep_range(800, 1200);
+	while (n < max) {
+		if (!(readb(b2 + AE9_U_LSR) & 0x01)) {
+			for (w = 0; w < 80 && !(readb(b2 + AE9_U_LSR) & 0x01); w++)
+				usleep_range(200, 300);	/* ~20 ms inter-byte */
+			if (!(readb(b2 + AE9_U_LSR) & 0x01))
+				break;
+		}
+		buf[n++] = readb(b2 + AE9_U_RBR);
+		if (n == 3 && buf[0] == 0xf0)
+			frame_len = buf[2] + 4;
+		/* Binary payloads can contain F7, including button durations. */
+		if (frame_len ? n == frame_len : buf[n - 1] == 0xf7)
+			break;
+	}
+	return n;
+}
+
+/* Match a complete reply before interpreting its command-specific payload. */
+static bool ae9_acm_reply_valid(const u8 *rx, int n, u8 cmd, u8 payload_len)
+{
+	return n == payload_len + 4 && rx[0] == 0xf0 && rx[1] == cmd &&
+		rx[2] == payload_len && rx[n - 1] == 0xf7;
+}
+
+static bool ae9_acm_probe_valid(const u8 *rx, int n)
+{
+	return ae9_acm_reply_valid(rx, n, 0x81, 5) && rx[3] != 0;
+}
+
+static bool ae9_acm_decode_knob(const u8 *rx, int n, int *dir, int *steps)
+{
+	if (!ae9_acm_reply_valid(rx, n, 0xc2, 4) || rx[3] > 1)
+		return false;
+
+	*dir = rx[3];
+	*steps = rx[4];
+	return true;
+}
+
+static int ae9_acm_decode_button(const u8 *rx, int n, int button)
+{
+	if (!ae9_acm_reply_valid(rx, n, 0xb1, 4) || rx[3] != button ||
+	    rx[4] != 1)
+		return 0;
+
+	return max(1, rx[5] | rx[6] << 8);
+}
+
+/* Fixed ACM session frames, shared by initialisation and keepalive. */
+static const u8 ae9_acm_probe_frame[] = { 0xf0, 0x81, 0x00, 0xf7 };
+static const u8 ae9_acm_unlock1_frame[] = {
+	0xf0, 0x54, 0x04, 'A', 'c', 'm', '1', 0xf7
+};
+
+static const u8 ae9_acm_unlock2_frame[] = {
+	0xf0, 0x54, 0x04, '1', 'm', 'c', 'A', 0xf7
+};
+
+static const u8 ae9_acm_read_frame[] = {
+	0xf0, 0xd5, 0x03, 0x00, 0x20, 0x04, 0xf7
+};
+
+static const u8 ae9_acm_unlock3_frame[] = {
+	0xf0, 0x54, 0x04, 0x11, 0x11, 0x11, 0x11, 0xf7
+};
+
+static void ae9_acm_cmd(struct ca0132_spec *spec, const u8 *p, int n)
+{
+	u8 ack[16];
+
+	ae9_acm_tx(spec, p, n);
+	ae9_acm_rx(spec, ack, sizeof(ack), 100);
+}
+
+/* Keepalive always sends these exchanges; init calls after a valid probe. */
+static void ae9_acm_unlock(struct ca0132_spec *spec)
+{
+	ae9_acm_cmd(spec, ae9_acm_unlock1_frame,
+		    sizeof(ae9_acm_unlock1_frame));
+	ae9_acm_cmd(spec, ae9_acm_unlock2_frame,
+		    sizeof(ae9_acm_unlock2_frame));
+	ae9_acm_cmd(spec, ae9_acm_read_frame, sizeof(ae9_acm_read_frame));
+	ae9_acm_cmd(spec, ae9_acm_unlock3_frame,
+		    sizeof(ae9_acm_unlock3_frame));
+}
+
+/* F0 03 03 <reg> <value> <mask> F7 : set register bits */
+static void ae9_acm_setreg(struct ca0132_spec *spec, u8 reg, u8 val, u8 mask)
+{
+	u8 f[7] = { 0xf0, 0x03, 0x03, reg, val, mask, 0xf7 };
+
+	ae9_acm_cmd(spec, f, sizeof(f));
+}
+
+/* F0 83 01 <reg> F7 -> F0 83 02 <reg> <value> F7 on ACM fw 0x019589c8. */
+static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
+{
+	u8 q[5] = { 0xf0, 0x83, 0x01, reg, 0xf7 };
+	u8 rx[8];
+	int n;
+
+	ae9_acm_tx(spec, q, sizeof(q));
+	n = ae9_acm_rx(spec, rx, 6, 100);
+	if (n != 6 || rx[0] != 0xf0 || rx[1] != 0x83 || rx[2] != 2 ||
+	    rx[3] != reg || rx[5] != 0xf7) {
+		codec_info(spec->codec,
+			   "AE-9 ACM: invalid register reply reg=%02x len=%d bytes=%*ph\n",
+			   reg, n, n, rx);
+		return -EIO;
+	}
+	return rx[4];
+}
+
+/* AE-9 ACM display, mixer and button actions. */
 /* F0 11 09 <8 ASCII, NUL padded> 00 F7 : display text */
 static void ae9_acm_display_frame(struct ca0132_spec *spec, const char *txt, bool wait)
 {
@@ -10694,9 +10734,6 @@ static void ae9_acm_show_volume(struct ca0132_spec *spec)
 	ae9_acm_display_frame(spec, txt, false);
 }
 
-/* Push the current Output Select to the ACM's analog mux (§10.6: reg2 bit2 =
- * HP select, reg2 bit6 = HP amp / HP_Mute off, reg7 bit0 = speaker select) and
- * show "-HP-"/"-SP-" for ~5 s like Windows (AcmShowSpeakerChangeMaxCounts). */
 /* F0 22 02 01 <0|1> F7: the ACM's SBX light (Windows sends its SBX state; the
  * capture had it on, which is why an earlier build lit it unconditionally). */
 static void ae9_acm_set_fx_light(struct ca0132_spec *spec, bool on)
@@ -10772,6 +10809,62 @@ static void ae9_toggle_ctl(struct hda_codec *codec, const char *name, bool is_en
 	kfree(uctl);
 }
 
+/* Volume knob: F0 C2 00 F7 -> RX 8: [3] dir, [4] detents, [5..6] ms (fw >= 0x01957D60).
+ * Mapping decoded from CtxHda 0x3f8a8 + board 0x35298 (2026-09-08):
+ *  - dir 0 = clockwise = louder, dir 1 = quieter (the board subtracts on dir 1);
+ *  - detents go through an accumulator, 2 detents = 1 ALSA volume step;
+ *    on a direction change the remainder is dropped and a single detent
+ *    counts as 2 so it moves immediately.
+ * Windows' ms-based acceleration (x2/x3/x4 for >4 detents per 50 ms poll) is
+ * deliberately NOT applied: our poll is slower, so it fired on normal turning
+ * and produced +40..+64 jumps. */
+static void ae9_acm_knob(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	static const u8 q[] = { 0xf0, 0xc2, 0x00, 0xf7 };
+	struct snd_kcontrol *kctl;
+	struct snd_ctl_elem_value *uctl;
+	u8 rx[8];
+	int n, dir, steps, delta;
+	long v, max_level;
+
+	if (!ae9_acm_knob_tx(spec, q, sizeof(q)))
+		return;
+	n = ae9_acm_rx(spec, rx, 8, 30);
+	if (!ae9_acm_decode_knob(rx, n, &dir, &steps))
+		return;
+	if (!steps)
+		return;
+	if (spec->ae9_knob_dir != dir) {
+		spec->ae9_knob_acc = (spec->ae9_knob_acc / 2) * 2;
+		if (steps == 1)
+			steps = 2;
+		spec->ae9_knob_dir = dir;
+	}
+	spec->ae9_knob_acc += dir ? -steps : steps;
+	delta = spec->ae9_knob_acc / 2;
+	spec->ae9_knob_acc -= delta * 2;
+	spec->ae9_acm_turbo = 10;
+	if (!delta)
+		return;
+	v = ae9_master_level(codec, &kctl, &max_level);
+	if (v < 0 || !kctl || !kctl->put)
+		return;
+	v = clamp(v + delta, 0L, max_level);
+	codec_info(codec, "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n", dir, rx[4], delta, v);
+	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
+	if (!uctl)
+		return;
+	uctl->value.integer.value[0] = v;
+	uctl->value.integer.value[1] = v;
+	n = kctl->put(kctl, uctl);		/* vmaster -> shared output volume */
+	kfree(uctl);
+	if (n <= 0)
+		return;
+	snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
+	ae9_acm_display_changed(spec);
+}
+
 /* The knob is button 2 (Windows 0x3f6b0): short press = mute, press held
  * between AcmEncoderMidPressMs (1500) and LongPressMs (3000) = output toggle,
  * longer = encoder LED (not implemented). */
@@ -10794,6 +10887,7 @@ static void ae9_acm_service_knob_press(struct hda_codec *codec)
 	}
 }
 
+/* AE-9 output selection and physical-jack updates. */
 /*
  * The ACM amp bit (reg2 bit6) only enables the headphone amplifier. On this
  * card the rear line-out is fed by the same ES9038Q2M as the headphones, so
@@ -10928,15 +11022,25 @@ static void ae9_acm_check_regs(struct hda_codec *codec)
 	ae9_acm_update_headphone_jack(codec, r2);
 }
 
+/* AE-9 ACM session maintenance and initialisation. */
+/* Windows sends the probe (F0 81 00 F7) on EVERY service tick as a keepalive
+ * (0x3fcd8). Returns true if the module answered. */
+static bool ae9_acm_keepalive(struct ca0132_spec *spec)
+{
+	u8 rx[16];
+	int n;
+
+	/* Windows sends these five every tick (capture: 164-167 each in 164 ticks) */
+	ae9_acm_tx(spec, ae9_acm_probe_frame, sizeof(ae9_acm_probe_frame));
+	n = ae9_acm_rx(spec, rx, sizeof(rx), 100);
+	ae9_acm_unlock(spec);
+	return ae9_acm_probe_valid(rx, n);
+}
+
 static bool ae9_acm_init(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	void __iomem *b2 = spec->mem_base;
-	static const u8 probe[] = { 0xf0, 0x81, 0x00, 0xf7 };
-	static const u8 unl1[]  = { 0xf0, 0x54, 0x04, 'A', 'c', 'm', '1', 0xf7 };
-	static const u8 unl2[]  = { 0xf0, 0x54, 0x04, '1', 'm', 'c', 'A', 0xf7 };
-	static const u8 rd[]    = { 0xf0, 0xd5, 0x03, 0x00, 0x20, 0x04, 0xf7 };
-	static const u8 unl3[]  = { 0xf0, 0x54, 0x04, 0x11, 0x11, 0x11, 0x11, 0xf7 };
 	static const u8 magic[] = { 0xf0, 0x55, 0x07, 0x00, 0x20, 0x04, 0xde, 0xc0, 0xad, 0xde, 0xf7 };
 	static const u8 reg5[]  = { 0xf0, 0x03, 0x03, 0x05, 0x03, 0x03, 0xf7 };
 	static const u8 tlong2[] = { 0xf0, 0x32, 0x03, 0x02, 0xb8, 0x0b, 0xf7 };
@@ -10976,7 +11080,8 @@ static bool ae9_acm_init(struct hda_codec *codec)
 		writeb(0x00, b2 + AE9_U_DLM); readb(b2 + AE9_U_DLM);
 		writeb(lcr & ~0x80, b2 + AE9_U_LCR); readb(b2 + AE9_U_LCR);
 		msleep(300);
-		ae9_acm_tx(spec, probe, sizeof(probe));
+		ae9_acm_tx(spec, ae9_acm_probe_frame,
+			   sizeof(ae9_acm_probe_frame));
 		n = ae9_acm_rx(spec, rx, 9, 500);
 		codec_info(codec, "AE-9 ACM: probe attempt %d%s -> %d bytes: %*ph\n",
 			   attempt, attempt ? " (after power-cycle)" : "", n,
@@ -10992,10 +11097,7 @@ static bool ae9_acm_init(struct hda_codec *codec)
 	spec->ae9_acm_fw = (u32)rx[4] | (u32)rx[5] << 8 |
 			   (u32)rx[6] << 16 | (u32)rx[7] << 24;
 	/* Windows init order (BAR2 capture 2026-09-03, once per session) */
-	ae9_acm_cmd(spec, unl1, sizeof(unl1));
-	ae9_acm_cmd(spec, unl2, sizeof(unl2));
-	ae9_acm_cmd(spec, rd, sizeof(rd));
-	ae9_acm_cmd(spec, unl3, sizeof(unl3));
+	ae9_acm_unlock(spec);
 	ae9_acm_cmd(spec, magic, sizeof(magic));	/* F0 55: write DEADC0DE @ 0x042000 */
 	ae9_acm_cmd(spec, reg5, sizeof(reg5));		/* detect handshake: reg5 |= 3 */
 	ae9_acm_cmd(spec, tlong2, sizeof(tlong2));	/* AcmEncoderLongPressMs 3000 */
@@ -11013,62 +11115,7 @@ static bool ae9_acm_init(struct hda_codec *codec)
 	return true;
 }
 
-/* Volume knob: F0 C2 00 F7 -> RX 8: [3] dir, [4] detents, [5..6] ms (fw >= 0x01957D60).
- * Mapping decoded from CtxHda 0x3f8a8 + board 0x35298 (2026-09-08):
- *  - dir 0 = clockwise = louder, dir 1 = quieter (the board subtracts on dir 1);
- *  - detents go through an accumulator, 2 detents = 1 ALSA volume step;
- *    on a direction change the remainder is dropped and a single detent
- *    counts as 2 so it moves immediately.
- * Windows' ms-based acceleration (x2/x3/x4 for >4 detents per 50 ms poll) is
- * deliberately NOT applied: our poll is slower, so it fired on normal turning
- * and produced +40..+64 jumps. */
-static void ae9_acm_knob(struct hda_codec *codec)
-{
-	struct ca0132_spec *spec = codec->spec;
-	static const u8 q[] = { 0xf0, 0xc2, 0x00, 0xf7 };
-	struct snd_kcontrol *kctl;
-	struct snd_ctl_elem_value *uctl;
-	u8 rx[8];
-	int n, dir, steps, delta;
-	long v, max_level;
-
-	if (!ae9_acm_knob_tx(spec, q, sizeof(q)))
-		return;
-	n = ae9_acm_rx(spec, rx, 8, 30);
-	if (!ae9_acm_decode_knob(rx, n, &dir, &steps))
-		return;
-	if (!steps)
-		return;
-	if (spec->ae9_knob_dir != dir) {
-		spec->ae9_knob_acc = (spec->ae9_knob_acc / 2) * 2;
-		if (steps == 1)
-			steps = 2;
-		spec->ae9_knob_dir = dir;
-	}
-	spec->ae9_knob_acc += dir ? -steps : steps;
-	delta = spec->ae9_knob_acc / 2;
-	spec->ae9_knob_acc -= delta * 2;
-	spec->ae9_acm_turbo = 10;
-	if (!delta)
-		return;
-	v = ae9_master_level(codec, &kctl, &max_level);
-	if (v < 0 || !kctl || !kctl->put)
-		return;
-	v = clamp(v + delta, 0L, max_level);
-	codec_info(codec, "AE-9 ACM: knob dir=%d detents=%d -> %+d => %ld\n", dir, rx[4], delta, v);
-	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
-	if (!uctl)
-		return;
-	uctl->value.integer.value[0] = v;
-	uctl->value.integer.value[1] = v;
-	n = kctl->put(kctl, uctl);		/* vmaster -> shared output volume */
-	kfree(uctl);
-	if (n <= 0)
-		return;
-	snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
-	ae9_acm_display_changed(spec);
-}
-
+/* AE-9 ACM worker: execute the jobs selected by the scheduler. */
 /* The 500 ms ACM service (Windows: thread 0x413b4; 50 ms "turbo" while the
  * knob moves). Also carries Windows' GPIO 5 keepalive. */
 static void ae9_acm_work_fn(struct work_struct *work)
@@ -13298,7 +13345,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
