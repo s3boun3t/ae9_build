@@ -137,3 +137,5 @@ personnels ne sont pas distribués.
 - `filterfix1` : Exposer les sept filtres ES9038Q2M valides et préserver la consigne lors des changements de sortie et de muet.
 
 - `pmfix1` : Terminer la détection avant de prendre le maintien PM, afin de ne pas attribuer la référence AE-9 au codec secondaire DBPro.
+
+- `dspfix2` : Propager les erreurs DMA, loader et overlay. Arrêter proprement une initialisation échouée et limiter l’exception PM EACCES au probe avant enregistrement et activation runtime-PM.

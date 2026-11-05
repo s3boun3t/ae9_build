@@ -23,6 +23,7 @@
 #include <linux/ktime.h>
 #include <linux/jiffies.h>
 #include <linux/spinlock.h>
+#include <linux/unaligned.h>
 
 /* AE-9 ACM service mode. 0 (default) = initialise the module once (unlock,
  * headphone amp on, display) and then leave it alone: no keepalive, no knob
@@ -2781,6 +2782,27 @@ static bool dsp_is_dma_active(struct hda_codec *codec, unsigned int dma_chan)
 			(DSPDMAC_CHNLSTART_EN_LOBIT + dma_chan))) != 0);
 }
 
+/* AE-9 download errors must not be mistaken for an idle DMA channel. */
+static int dsp_get_dma_active(struct hda_codec *codec, unsigned int dma_chan,
+			      bool *active)
+{
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int reg;
+	int err;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9) {
+		*active = dsp_is_dma_active(codec, dma_chan);
+		return 0;
+	}
+	if (dma_chan >= DSPDMAC_DMA_CFG_CHANNEL_COUNT)
+		return -EINVAL;
+	err = chipio_read(codec, DSPDMAC_CHNLSTART_INST_OFFSET, &reg);
+	if (err < 0)
+		return err;
+	*active = !!(reg & (1 << (DSPDMAC_CHNLSTART_EN_LOBIT + dma_chan)));
+	return 0;
+}
+
 static int dsp_dma_setup_common(struct hda_codec *codec,
 				unsigned int chip_addx,
 				unsigned int dma_chan,
@@ -2791,7 +2813,7 @@ static int dsp_dma_setup_common(struct hda_codec *codec,
 	unsigned int chnl_prop;
 	unsigned int dsp_addx;
 	unsigned int active;
-	bool code, yram;
+	bool code, yram, dma_active;
 
 	codec_dbg(codec, "-- dsp_dma_setup_common() -- Begin ---------\n");
 
@@ -2800,7 +2822,10 @@ static int dsp_dma_setup_common(struct hda_codec *codec,
 		return -EINVAL;
 	}
 
-	if (dsp_is_dma_active(codec, dma_chan)) {
+	status = dsp_get_dma_active(codec, dma_chan, &dma_active);
+	if (status < 0)
+		return status;
+	if (dma_active) {
 		codec_dbg(codec, "dma already active\n");
 		return -EBUSY;
 	}
@@ -3388,40 +3413,54 @@ static int dspxfr_hci_write(struct hda_codec *codec,
  * is replayed. Segment 2 is the 20 words AFTER 0x3f3a0 (Windows writes that
  * first word by chipio). Replies are logged: they teach us the semantics.
  */
-static void ae9_loader_announce_seg(struct hda_codec *codec,
-				    unsigned int chip_addx, unsigned int nwords)
+static int ae9_loader_announce_seg(struct hda_codec *codec,
+				   unsigned int chip_addx, unsigned int nwords)
 {
 	unsigned int w3a[2], w3b[2], reply[2], reply_len;
-	unsigned int w1 = 0, lo16 = 0, flags = 0;
+	unsigned int w1, lo16, flags;
+	int err;
 
-	if (chip_addx == 0x0b7b10) {
-		w1 = 0xffffd080; lo16 = 0xdec4; flags = 0x80000000;
-	} else if (chip_addx == 0x03f3a4) {
-		w1 = 0x00000000; lo16 = 0xfce9; flags = 0x00000000;
+	if (chip_addx == 0x0b7b10 && nwords == 78) {
+		w1 = 0xffffd080;
+		lo16 = 0xdec4;
+		flags = 0x80000000;
+	} else if (chip_addx == 0x03f3a4 && nwords == 20) {
+		w1 = 0;
+		lo16 = 0xfce9;
+		flags = 0;
 	} else {
-		codec_warn(codec, "AE-9 loader: unknown segment %08x (%u words)\n",
-			   chip_addx, nwords);
+		return -EINVAL;
 	}
 
-	w3a[0] = 3; w3a[1] = w1;
-	reply_len = sizeof(reply); reply[0] = reply[1] = 0xdeadbeef;
-	if (dspio_scp(codec, MASTERCONTROL, 0x00, 0x3a, SCP_GET, w3a,
-		      sizeof(w3a), reply, &reply_len) < 0)
-		codec_warn(codec, "AE-9 loader: 0x3a [%08x %08x] no reply\n",
-			   w3a[0], w3a[1]);
-	else
-		codec_info(codec, "AE-9 loader: 0x3a [%08x %08x] -> %08x %08x (%u B)\n",
-			   w3a[0], w3a[1], reply[0], reply[1], reply_len);
+	w3a[0] = 3;
+	w3a[1] = w1;
+	reply_len = sizeof(reply);
+	reply[0] = 0xdeadbeef;
+	reply[1] = 0xdeadbeef;
+	err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x3a, SCP_GET, w3a,
+			sizeof(w3a), reply, &reply_len);
+	if (err < 0)
+		return err;
+	/* Captured replies contain one word; also allow the full buffer. */
+	if (reply_len != sizeof(reply[0]) && reply_len != sizeof(reply))
+		return -EPROTO;
+	codec_info(codec, "AE-9 loader: 0x3a [%08x %08x] -> %08x %08x (%u B)\n",
+		   w3a[0], w3a[1], reply[0], reply[1], reply_len);
 
-	w3b[0] = (nwords << 16) | lo16; w3b[1] = flags;
-	reply_len = sizeof(reply); reply[0] = reply[1] = 0xdeadbeef;
-	if (dspio_scp(codec, MASTERCONTROL, 0x00, 0x3b, SCP_GET, w3b,
-		      sizeof(w3b), reply, &reply_len) < 0)
-		codec_warn(codec, "AE-9 loader: 0x3b [%08x %08x] no reply\n",
-			   w3b[0], w3b[1]);
-	else
-		codec_info(codec, "AE-9 loader: 0x3b [%08x %08x] -> %08x %08x (%u B)\n",
-			   w3b[0], w3b[1], reply[0], reply[1], reply_len);
+	w3b[0] = (nwords << 16) | lo16;
+	w3b[1] = flags;
+	reply_len = sizeof(reply);
+	reply[0] = 0xdeadbeef;
+	reply[1] = 0xdeadbeef;
+	err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x3b, SCP_GET, w3b,
+			sizeof(w3b), reply, &reply_len);
+	if (err < 0)
+		return err;
+	if (reply_len != sizeof(reply[0]) && reply_len != sizeof(reply))
+		return -EPROTO;
+	codec_info(codec, "AE-9 loader: 0x3b [%08x %08x] -> %08x %08x (%u B)\n",
+		   w3b[0], w3b[1], reply[0], reply[1], reply_len);
+	return 0;
 }
 
 static int dspxfr_one_seg(struct hda_codec *codec,
@@ -3435,6 +3474,8 @@ static int dspxfr_one_seg(struct hda_codec *codec,
 	struct ca0132_spec *spec = codec->spec;
 	int status = 0;
 	bool comm_dma_setup_done = false;
+	bool ae9 = ca0132_quirk(spec) == QUIRK_AE9;
+	bool dsp_started = false, hda_started = false;
 	const unsigned int *data;
 	unsigned int chip_addx;
 	unsigned int words_to_write;
@@ -3536,74 +3577,97 @@ static int dspxfr_one_seg(struct hda_codec *codec,
 		run_size_words = min(buffer_size_words, words_to_write);
 		codec_dbg(codec, "dspxfr (seg loop)cnt=%u rs=%u remainder=%u\n",
 			    words_to_write, run_size_words, remainder_words);
-		dma_xfer(dma_engine, data, run_size_words*sizeof(u32));
+		status = dma_xfer(dma_engine, data, run_size_words * sizeof(u32));
+		if (ae9 && status < 0)
+			goto fail;
 		if (spec->ae9_dsp_loader) {
-			/* AE-9 loader mode: no host DSPDMAC writes. Announce the
-			 * segment; the DSP programs ch0 itself and pulls the bytes
-			 * from the HDA stream started below (Windows polls only). */
-			ae9_loader_announce_seg(codec, chip_addx, run_size_words);
-			if (!dsp_is_dma_active(codec, dma_chan))
+			/* The DSP loader may start DMA only after HDA RUN. */
+			dsp_started = true;
+			status = ae9_loader_announce_seg(codec, chip_addx,
+							 run_size_words);
+			if (status < 0)
+				goto fail;
+			status = dsp_get_dma_active(codec, dma_chan, &dma_active);
+			if (status < 0)
+				goto fail;
+			if (!dma_active)
 				codec_warn(codec, "AE-9 loader: DSP did not start DMA ch%u for %08x\n",
 					   dma_chan, chip_addx);
 		} else {
-		if (!comm_dma_setup_done) {
-			status = dsp_dma_stop(codec, dma_chan, ovly);
-			if (status < 0)
-				return status;
-			status = dsp_dma_setup_common(codec, chip_addx,
-						dma_chan, port_map_mask, ovly);
-			if (status < 0)
-				return status;
-			comm_dma_setup_done = true;
-		}
+			if (!comm_dma_setup_done) {
+				status = dsp_dma_stop(codec, dma_chan, ovly);
+				if (status < 0)
+					goto fail;
+				status = dsp_dma_setup_common(codec, chip_addx,
+							      dma_chan, port_map_mask, ovly);
+				if (status < 0)
+					goto fail;
+				comm_dma_setup_done = true;
+			}
 
-		status = dsp_dma_setup(codec, chip_addx,
-						run_size_words, dma_chan);
-		if (status < 0)
-			return status;
-		status = dsp_dma_start(codec, dma_chan, ovly);
-		if (status < 0)
-			return status;
-		if (!dsp_is_dma_active(codec, dma_chan)) {
-			codec_dbg(codec, "dspxfr:DMA did not start\n");
-			return -EIO;
+			status = dsp_dma_setup(codec, chip_addx,
+					       run_size_words, dma_chan);
+			if (status < 0)
+				goto fail;
+			dsp_started = true;
+			status = dsp_dma_start(codec, dma_chan, ovly);
+			if (status < 0)
+				goto fail;
+			status = dsp_get_dma_active(codec, dma_chan, &dma_active);
+			if (status < 0)
+				goto fail;
+			if (!dma_active) {
+				codec_dbg(codec, "dspxfr:DMA did not start\n");
+				status = -EIO;
+				goto fail;
+			}
 		}
-		}
+		hda_started = true;
 		status = dma_set_state(dma_engine, DMA_STATE_RUN);
 		if (status < 0)
-			return status;
+			goto fail;
 		if (remainder_words != 0) {
 			status = chipio_write_multiple(codec,
 						chip_addx_remainder,
 						data_remainder,
 						remainder_words);
 			if (status < 0)
-				return status;
+				goto fail;
 			remainder_words = 0;
 		}
 		if (hci_write) {
 			status = dspxfr_hci_write(codec, hci_write);
 			if (status < 0)
-				return status;
+				goto fail;
 			hci_write = NULL;
 		}
 
 		timeout = jiffies + msecs_to_jiffies(2000);
 		do {
-			dma_active = dsp_is_dma_active(codec, dma_chan);
+			status = dsp_get_dma_active(codec, dma_chan, &dma_active);
+			if (status < 0)
+				goto fail;
 			if (!dma_active)
 				break;
 			msleep(20);
 		} while (time_before(jiffies, timeout));
-		if (dma_active)
-			break;
+		if (dma_active) {
+			if (!ae9)
+				break;
+			status = -ETIMEDOUT;
+			goto fail;
+		}
+		dsp_started = false;
 
 		codec_dbg(codec, "+++++ DMA complete\n");
-		dma_set_state(dma_engine, DMA_STATE_STOP);
+		status = dma_set_state(dma_engine, DMA_STATE_STOP);
+		if (ae9 && status < 0)
+			goto fail;
+		hda_started = false;
 		status = dma_reset(dma_engine);
 
 		if (status < 0)
-			return status;
+			goto fail;
 
 		data += run_size_words;
 		chip_addx += run_size_words*sizeof(u32);
@@ -3615,6 +3679,16 @@ static int dspxfr_one_seg(struct hda_codec *codec,
 					data_remainder, remainder_words);
 	}
 
+	return status;
+
+fail:
+	if (ae9) {
+		/* Keep the transfer error even if stopping an engine also fails. */
+		if (hda_started)
+			dma_set_state(dma_engine, DMA_STATE_STOP);
+		if (dsp_started)
+			dsp_dma_stop(codec, dma_chan, ovly);
+	}
 	return status;
 }
 
@@ -3639,13 +3713,15 @@ static int dspxfr_image(struct hda_codec *codec,
 			bool ovly)
 {
 	struct ca0132_spec *spec = codec->spec;
-	int status;
+	int status, err;
+	bool ae9 = ca0132_quirk(spec) == QUIRK_AE9;
+	bool converter_attached = false, ports_requested = false;
 	unsigned short hda_format = 0;
 	unsigned int response;
 	unsigned char stream_id = 0;
 	struct dma_engine *dma_engine;
 	unsigned int dma_chan;
-	unsigned int port_map_mask;
+	unsigned int port_map_mask = 0;
 
 	if (fls_data == NULL)
 		return -EINVAL;
@@ -3694,6 +3770,7 @@ static int dspxfr_image(struct hda_codec *codec,
 	}
 
 	port_map_mask = 0;
+	ports_requested = true;
 	status = dsp_allocate_ports_format(codec, hda_format,
 					&port_map_mask);
 	if (status < 0) {
@@ -3702,6 +3779,7 @@ static int dspxfr_image(struct hda_codec *codec,
 	}
 
 	stream_id = dma_get_stream_id(dma_engine);
+	converter_attached = true;
 	status = codec_set_converter_stream_channel(codec,
 			WIDGET_CHIP_CTRL, stream_id, 0, &response);
 	if (status < 0) {
@@ -3728,6 +3806,9 @@ static int dspxfr_image(struct hda_codec *codec,
 			fls_data = get_next_seg_ptr(fls_data);
 	}
 
+	if (ae9)
+		goto exit;
+
 	if (port_map_mask != 0)
 		status = dsp_free_ports(codec);
 
@@ -3738,8 +3819,25 @@ static int dspxfr_image(struct hda_codec *codec,
 				WIDGET_CHIP_CTRL, 0, 0, &response);
 
 exit:
-	if (ovly && (dma_chan != INVALID_DMA_CHANNEL))
-		dspio_free_dma_chan(codec, dma_chan);
+	if (ae9) {
+		/* Unwind all acquired resources without losing the first error. */
+		if (ports_requested) {
+			err = dsp_free_ports(codec);
+			if (status >= 0)
+				status = err;
+		}
+		if (converter_attached) {
+			err = codec_set_converter_stream_channel(codec,
+								 WIDGET_CHIP_CTRL, 0, 0, &response);
+			if (status >= 0)
+				status = err;
+		}
+	}
+	if (ovly && dma_chan != INVALID_DMA_CHANNEL) {
+		err = dspio_free_dma_chan(codec, dma_chan);
+		if (ae9 && status >= 0)
+			status = err;
+	}
 
 	if (dma_engine->dmab->area)
 		snd_hda_codec_load_dsp_cleanup(codec, dma_engine->dmab);
@@ -5025,9 +5123,9 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 	if (out_info->scp_cmds_count) {
 		for (i = 0; i < out_info->scp_cmds_count; i++) {
 			err = dspio_set_uint_param(codec,
-					out_info->scp_cmd_mid[i],
-					out_info->scp_cmd_req[i],
-					out_info->scp_cmd_val[i]);
+						   out_info->scp_cmd_mid[i],
+						   out_info->scp_cmd_req[i],
+						   out_info->scp_cmd_val[i]);
 			if (err < 0)
 				return err;
 		}
@@ -5036,8 +5134,10 @@ static int ca0132_alt_select_out_quirk_set(struct hda_codec *codec)
 	chipio_set_control_param(codec, 0x0d, out_info->dac2port);
 
 	if (out_info->has_chipio_write) {
-		chipio_write(codec, out_info->chipio_write_addr,
-				out_info->chipio_write_data);
+		err = chipio_write(codec, out_info->chipio_write_addr,
+				   out_info->chipio_write_data);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 	}
 
 	if (quirk_data->has_headphone_gain) {
@@ -5072,6 +5172,19 @@ static void ca0132_set_out_node_pincfg(struct hda_codec *codec, hda_nid_t nid,
 	snd_hda_set_pin_ctl(codec, nid, pin_ctl);
 }
 
+static int ae9_pm_error(struct hda_codec *codec, int err)
+{
+	/*
+	 * HDA powers the codec before init, but enables runtime PM only at
+	 * codec registration. Keep that pre-registration case distinct from
+	 * a failure to resume an already registered codec.
+	 */
+	if (err == -EACCES && !codec->core.registered &&
+	    !pm_runtime_enabled(hda_codec_dev(codec)))
+		return 0;
+	return err;
+}
+
 /*
  * This function behaves similarly to the ca0132_select_out funciton above,
  * except with a few differences. It adds the ability to select the current
@@ -5093,6 +5206,11 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	codec_dbg(codec, "%s\n", __func__);
 
 	CLASS(snd_hda_power_pm, pm)(codec);
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		err = ae9_pm_error(codec, pm.err);
+		if (err < 0)
+			return err;
+	}
 
 	auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
 
@@ -5189,9 +5307,12 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	 * make sure that it's properly enabled/disabled for speaker
 	 * configurations with an LFE channel.
 	 */
-	if (outfx_set)
-		ca0132_effects_set(codec, X_BASS,
-			spec->effects_switch[X_BASS - EFFECT_START_NID]);
+	if (outfx_set) {
+		err = ca0132_effects_set(codec, X_BASS,
+					 spec->effects_switch[X_BASS - EFFECT_START_NID]);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
+	}
 
 	/* Set speaker EQ bypass attenuation to 0. */
 	err = dspio_set_uint_param(codec, 0x8f, 0x01, FLOAT_ZERO);
@@ -5203,7 +5324,7 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 	 * to zero when setting the output.
 	 */
 	err = dspio_set_uint_param(codec, 0x96,
-			SPEAKER_TUNING_USE_SPEAKER_EQ, FLOAT_ZERO);
+				   SPEAKER_TUNING_USE_SPEAKER_EQ, FLOAT_ZERO);
 	if (err < 0)
 		return err;
 
@@ -5217,7 +5338,7 @@ static int __ca0132_alt_select_out(struct hda_codec *codec)
 
 	/* Unmute DSP now that we're done with output selection. */
 	err = dspio_set_uint_param(codec, 0x96,
-			SPEAKER_TUNING_MUTE, FLOAT_ZERO);
+				   SPEAKER_TUNING_MUTE, FLOAT_ZERO);
 	if (err < 0)
 		return err;
 
@@ -5239,6 +5360,9 @@ static int ca0132_alt_select_out(struct hda_codec *codec)
 		return __ca0132_alt_select_out(codec);
 
 	CLASS(snd_hda_power_pm, pm)(codec);
+	err = ae9_pm_error(codec, pm.err);
+	if (err < 0)
+		return err;
 	mutex_lock(&spec->ae9_output_mutex);
 	err = __ca0132_alt_select_out(codec);
 	mutex_unlock(&spec->ae9_output_mutex);
@@ -5730,7 +5854,9 @@ static int ca0132_effects_set(struct hda_codec *codec, hda_nid_t nid, long val)
 				} else
 					tmp = FLOAT_ONE;
 
-				dspio_set_uint_param(codec, 0x80, 0x00, tmp);
+				err = dspio_set_uint_param(codec, 0x80, 0x00, tmp);
+				if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+					return err;
 			}
 		}
 		/*
@@ -5749,7 +5875,9 @@ static int ca0132_effects_set(struct hda_codec *codec, hda_nid_t nid, long val)
 			} else
 				tmp = FLOAT_ZERO;
 
-			dspio_set_uint_param(codec, 0x47, 0x00, tmp);
+			err = dspio_set_uint_param(codec, 0x47, 0x00, tmp);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
 		}
 
 		/* If rear line in disable effects. */
@@ -5766,7 +5894,7 @@ static int ca0132_effects_set(struct hda_codec *codec, hda_nid_t nid, long val)
 				   ca0132_effects[idx].reqs[0], on);
 
 	if (err < 0)
-		return 0; /* no changed */
+		return ca0132_quirk(spec) == QUIRK_AE9 ? err : 0;
 
 	return 1;
 }
@@ -5778,19 +5906,26 @@ static int ca0132_pe_switch_set(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	hda_nid_t nid;
-	int i, ret = 0;
+	int i, err, ret = 0;
 
 	codec_dbg(codec, "ca0132_pe_switch_set: val=%ld\n",
 		    spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID]);
 
-	if (ca0132_use_alt_functions(spec))
-		ca0132_alt_select_out(codec);
+	if (ca0132_use_alt_functions(spec)) {
+		err = ca0132_alt_select_out(codec);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
+	}
 
 	i = OUT_EFFECT_START_NID - EFFECT_START_NID;
 	nid = OUT_EFFECT_START_NID;
 	/* PE affects all out effects */
-	for (; nid < OUT_EFFECT_END_NID; nid++, i++)
-		ret |= ca0132_effects_set(codec, nid, spec->effects_switch[i]);
+	for (; nid < OUT_EFFECT_END_NID; nid++, i++) {
+		err = ca0132_effects_set(codec, nid, spec->effects_switch[i]);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return err;
+		ret |= err;
+	}
 
 	return ret;
 }
@@ -6882,19 +7017,26 @@ static int ca0132_switch_put(struct snd_kcontrol *kcontrol,
 /* The DSP latches this module's value at stream start, so it must be at 0 dB
  * BEFORE any stream (WirePlumber's probe streams, the first Spotify stream)
  * opens the device; a stale value stays in effect until the device is closed. */
-static void ae9_dsp_volume_unity(struct hda_codec *codec)
+static int ae9_dsp_volume_unity(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
+	unsigned int val;
+	int i, err;
 
+	if (spec->dsp_state != DSP_DOWNLOADED)
+		return -EIO;
 	if (spec->ae9_dsp_vol_zeroed)
-		return;
-	dspio_set_uint_param(codec, ca0132_alt_vol_ctls[DSP_VOL_OUT].mid,
-			     ca0132_alt_vol_ctls[DSP_VOL_OUT].reqs[0], float_vol_db_lookup[90]);
-	dspio_set_uint_param(codec, ca0132_alt_vol_ctls[DSP_VOL_OUT].mid,
-			     ca0132_alt_vol_ctls[DSP_VOL_OUT].reqs[1], float_vol_db_lookup[90]);
-	dspio_set_uint_param(codec, ca0132_alt_vol_ctls[DSP_VOL_OUT].mid,
-			     ca0132_alt_vol_ctls[DSP_VOL_OUT].reqs[2], FLOAT_ZERO);
+		return 0;
+	for (i = 0; i < 3; i++) {
+		val = i == 2 ? FLOAT_ZERO : float_vol_db_lookup[90];
+		err = dspio_set_uint_param(codec,
+					   ca0132_alt_vol_ctls[DSP_VOL_OUT].mid,
+					   ca0132_alt_vol_ctls[DSP_VOL_OUT].reqs[i], val);
+		if (err < 0)
+			return err;
+	}
 	spec->ae9_dsp_vol_zeroed = true;
+	return 0;
 }
 
 /* Use the same HDA dB steps that ALSA advertises, without a second curve. */
@@ -6908,8 +7050,12 @@ static int ae9_master_apply(struct snd_kcontrol *kcontrol,
 	int err;
 
 	CLASS(snd_hda_power, pm)(codec);
-	ae9_dsp_volume_unity(codec);
+	if (pm.err < 0)
+		return pm.err;
 	guard(mutex)(&codec->control_mutex);
+	err = ae9_dsp_volume_unity(codec);
+	if (err < 0)
+		return err;
 	err = snd_hda_mixer_amp_volume_put(kcontrol, ucontrol);
 	/* A failed stereo put may already have changed one channel. */
 	ae9_acm_display_changed(spec);
@@ -9216,26 +9362,56 @@ static void ae9_post_dsp_finish(struct hda_codec *codec)
 #define AE9_OVERLAY_WORDS	108
 MODULE_FIRMWARE(AE9_OVERLAY_FW);
 
-static void ae9_dsp_scp_startup(struct hda_codec *codec)
+static int ae9_validate_overlay(const struct firmware *fw)
+{
+	static const struct {
+		unsigned int word, addr, count;
+	} headers[] = {
+		{ 0, 0x0b7b10, 78 },
+		{ 81, 0x03f3a0, 21 },
+		{ 105, 0xefbeadde, 0 },
+	};
+	const u8 *p;
+	unsigned int i;
+
+	if (fw->size != AE9_OVERLAY_WORDS * sizeof(u32))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(headers); i++) {
+		p = fw->data + headers[i].word * sizeof(u32);
+		if (get_unaligned_le32(p) != 0x4c46584d ||
+		    get_unaligned_le32(p + 4) != headers[i].addr ||
+		    get_unaligned_le32(p + 8) != headers[i].count)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+static int ae9_dsp_scp_startup(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	static const unsigned int seq[] = { 4, 5, 0 };
 	const struct firmware *ovl_fw = NULL;
 	const u32 *overlay;
 	unsigned int val, reply, reply_len, rb = 0;
-	int i, j;
+	u32 *ld = NULL;
+	bool overlay_started = false;
+	int i, j, err;
 
 	val = 3;
-	dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &val, sizeof(val),
-		  NULL, NULL);
+	err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &val,
+			sizeof(val), NULL, NULL);
+	if (err < 0)
+		return err;
 	for (i = 0; i < 2; i++) {
 		reply_len = sizeof(reply);
 		reply = 0xdeadbeef;
-		if (dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_GET, NULL, 0,
-			      &reply, &reply_len) < 0)
-			codec_warn(codec, "AE-9: MC state 3 GET%d: no reply\n", i);
-		else
-			codec_info(codec, "AE-9: MC state 3 GET%d -> %08x\n", i, reply);
+		err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_GET,
+				NULL, 0, &reply, &reply_len);
+		if (err < 0)
+			return err;
+		if (reply_len != sizeof(reply))
+			return -EPROTO;
+		codec_info(codec, "AE-9: MC state 3 GET%d -> %08x\n", i, reply);
 	}
 
 	/*
@@ -9247,21 +9423,25 @@ static void ae9_dsp_scp_startup(struct hda_codec *codec)
 	 * segment chip addresses directly (the capture's SCP 0x3a/0x3b address
 	 * queries are internal to the Windows loader and are not needed here).
 	 */
-	if (request_firmware(&ovl_fw, AE9_OVERLAY_FW, codec->card->dev) < 0 ||
-	    ovl_fw->size != AE9_OVERLAY_WORDS * sizeof(u32)) {
-		codec_err(codec, "AE-9: firmware %s missing or not %u bytes -- the DSP output stays disconnected (silence). Run tools/ae9-firmware-extract.sh (see README)\n",
-			  AE9_OVERLAY_FW, AE9_OVERLAY_WORDS * 4);
-		if (ovl_fw)
-			release_firmware(ovl_fw);
-		ovl_fw = NULL;
-		goto overlay_done;
+	err = request_firmware(&ovl_fw, AE9_OVERLAY_FW, codec->card->dev);
+	if (err < 0) {
+		codec_err(codec, "AE-9: missing overlay %s: %d\n",
+			  AE9_OVERLAY_FW, err);
+		return err;
+	}
+	err = ae9_validate_overlay(ovl_fw);
+	if (err < 0) {
+		codec_err(codec, "AE-9: invalid overlay %s\n", AE9_OVERLAY_FW);
+		goto out;
 	}
 	overlay = (const u32 *)ovl_fw->data;
-	spec->ae9_loader_ctx = true;	/* DMA alloc/free via SCP src 0x00, as Windows */
-	if (dspload_image(codec, (const struct dsp_image_seg *)overlay,
-			  true, 0, false, 0) < 0)
-		codec_warn(codec, "AE-9: output-connect overlay load failed\n");
+	overlay_started = true;
+	spec->ae9_loader_ctx = true;
+	err = dspload_image(codec, (const struct dsp_image_seg *)overlay,
+			    true, 0, false, 0);
 	spec->ae9_loader_ctx = false;
+	if (err < 0)
+		goto out;
 
 	/*
 	 * Now replay Windows' ACTUAL overlay path: the same bytes, but each
@@ -9273,28 +9453,28 @@ static void ae9_dsp_scp_startup(struct hda_codec *codec)
 	 * Loader image: seg1 verbatim + seg2 = the 20 words after 0x3f3a0
 	 * (0x3f3a4..), since Windows writes 0x3f3a0 itself by chipio below.
 	 */
-	{
-		const u32 *src = overlay;
-		u32 *ld = kmalloc_array(3 + 78 + 3 + 20 + 3, sizeof(u32),
-					GFP_KERNEL);
-
-		if (ld) {
-			memcpy(ld, src, (3 + 78) * sizeof(u32));	/* seg1 */
-			ld[81] = 0x4c46584d; ld[82] = 0x0003f3a4; ld[83] = 20;
-			memcpy(&ld[84], &src[85], 20 * sizeof(u32));	/* seg2[1..20] */
-			ld[104] = 0x4c46584d; ld[105] = 0xefbeadde; ld[106] = 0;
-			spec->ae9_loader_ctx = true;
-			spec->ae9_dsp_loader = true;
-			if (dspload_image(codec, (const struct dsp_image_seg *)ld,
-					  true, 0, false, 0) < 0)
-				codec_warn(codec, "AE-9: loader-mode overlay load failed\n");
-			spec->ae9_dsp_loader = false;
-			spec->ae9_loader_ctx = false;
-			kfree(ld);
-		}
+	ld = kmalloc_array(3 + 78 + 3 + 20 + 3, sizeof(u32), GFP_KERNEL);
+	if (!ld) {
+		err = -ENOMEM;
+		goto out;
 	}
-	release_firmware(ovl_fw);
-overlay_done:
+	memcpy(ld, overlay, (3 + 78) * sizeof(u32));
+	ld[81] = 0x4c46584d;
+	ld[82] = 0x0003f3a4;
+	ld[83] = 20;
+	memcpy(&ld[84], &overlay[85], 20 * sizeof(u32));
+	ld[104] = 0x4c46584d;
+	ld[105] = 0xefbeadde;
+	ld[106] = 0;
+	spec->ae9_loader_ctx = true;
+	spec->ae9_dsp_loader = true;
+	err = dspload_image(codec, (const struct dsp_image_seg *)ld,
+			    true, 0, false, 0);
+	spec->ae9_dsp_loader = false;
+	spec->ae9_loader_ctx = false;
+	if (err < 0)
+		goto out;
+
 	/*
 	 * The overlay downloads leave DSPDMAC ch0 "started" with the host DMA
 	 * config (idle dump: CHNLSTART=1, DMACFG ch0=029e6744) and it stays that
@@ -9303,14 +9483,24 @@ overlay_done:
 	 * outputs zeros -- proven by the ES9038 automute tripping on a loud tone.
 	 * Windows never host-DMAs the overlay, so it has no such residue. Clear it.
 	 */
-	dsp_dma_stop(codec, 0, true);
-	chipio_write(codec, 0x3f3a0, 0x00800082);
+	err = dsp_dma_stop(codec, 0, true);
+	if (err < 0)
+		goto out;
+	err = chipio_write(codec, 0x3f3a0, 0x00800082);
+	if (err < 0)
+		goto out;
 	/*
 	 * Prove the overlay landed: word 5 of the 0x3f3a0 table is 0x04000086
 	 * and is written only by the DMA (chipio is byte-addressed: +5*4).
 	 */
-	chipio_read(codec, 0x3f3b4, &rb);
+	err = chipio_read(codec, 0x3f3b4, &rb);
+	if (err < 0)
+		goto out;
 	codec_info(codec, "AE-9: overlay readback 0x3f3b4=%08x (want 04000086)\n", rb);
+	if (rb != 0x04000086) {
+		err = -EIO;
+		goto out;
+	}
 
 	/*
 	 * 0x0a is MASTERCONTROL_ALLOC_DMA_CHAN: "0x0a SET 0" is the FREE of DMA
@@ -9318,27 +9508,43 @@ overlay_done:
 	 * dspload_image above already sent via dspio_free_dma_chan. Not repeated.
 	 */
 	val = 1;
-	dspio_scp(codec, MASTERCONTROL, 0x00, 0x0b, SCP_SET, &val, sizeof(val),
-		  NULL, NULL);
+	err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0b, SCP_SET, &val,
+			sizeof(val), NULL, NULL);
+	if (err < 0)
+		goto out;
 
 	for (i = 0; i < ARRAY_SIZE(seq); i++) {
 		val = seq[i];
-		dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &val,
-			  sizeof(val), NULL, NULL);
+		err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_SET, &val,
+				sizeof(val), NULL, NULL);
+		if (err < 0)
+			goto out;
 		for (j = 0; j < 2; j++) {
 			reply_len = sizeof(reply);
 			reply = 0xdeadbeef;
-			if (dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_GET,
-				      NULL, 0, &reply, &reply_len) < 0)
-				codec_warn(codec, "AE-9: MC state %u GET%d: no reply\n",
-					   seq[i], j);
-			else
-				codec_info(codec, "AE-9: MC state %u GET%d -> %08x\n",
-					   seq[i], j, reply);
+			err = dspio_scp(codec, MASTERCONTROL, 0x00, 0x0c, SCP_GET,
+					NULL, 0, &reply, &reply_len);
+			if (err < 0)
+				goto out;
+			if (reply_len != sizeof(reply)) {
+				err = -EPROTO;
+				goto out;
+			}
+			/* Replies are asynchronous; do not require reply == val. */
+			codec_info(codec, "AE-9: MC state %u GET%d -> %08x\n",
+				   seq[i], j, reply);
 		}
 	}
 
-	chipio_write(codec, 0x100e34, 0xf1000000);
+	err = chipio_write(codec, 0x100e34, 0xf1000000);
+out:
+	spec->ae9_dsp_loader = false;
+	spec->ae9_loader_ctx = false;
+	if (err < 0 && overlay_started)
+		dsp_dma_stop(codec, 0, true);
+	kfree(ld);
+	release_firmware(ovl_fw);
+	return err;
 }
 
 /*
@@ -9350,14 +9556,20 @@ overlay_done:
  * frozen. Streams are started later, after the routing, in
  * ae9_post_dsp_asi_pll_setup().
  */
-static void ae9_dsp_defaults(struct hda_codec *codec)
+static int ae9_dsp_defaults(struct hda_codec *codec)
 {
+	int err;
+
 	chipio_set_conn_rate(codec, MEM_CONNID_MICIN1, SR_96_000);
 	chipio_set_conn_rate(codec, MEM_CONNID_MICOUT1, SR_96_000);
-	dspio_set_uint_param(codec, 0x80, 0x00, FLOAT_THREE);
+	err = dspio_set_uint_param(codec, 0x80, 0x00, FLOAT_THREE);
+	if (err < 0)
+		return err;
 	chipio_set_conn_rate(codec, MEM_CONNID_MICIN2, SR_96_000);
 	chipio_set_conn_rate(codec, MEM_CONNID_MICOUT2, SR_96_000);
-	dspio_set_uint_param(codec, 0x80, 0x01, FLOAT_THREE);
+	err = dspio_set_uint_param(codec, 0x80, 0x01, FLOAT_THREE);
+	if (err < 0)
+		return err;
 
 	/* ES9038 THD table cleared, master trim 0 dB, front muted */
 	ae9_dac_write(codec, 0x0d, 0x00);
@@ -9371,12 +9583,23 @@ static void ae9_dsp_defaults(struct hda_codec *codec)
 	ae9_dac_write(codec, 0x14, 0x7f);
 	ae9_dac_write(codec, 0x1d, 0x80);
 
-	dspio_set_uint_param(codec, 0x80, 0x0d, FLOAT_ZERO);
-	dspio_set_uint_param(codec, 0x80, 0x0e, FLOAT_ZERO);
-	dspio_set_uint_param(codec, 0x96, 0x3c, FLOAT_ZERO);
-	dspio_set_uint_param(codec, 0x31, 0x00, FLOAT_TWO);
-	dspio_set_uint_param(codec, 0x32, 0x00, FLOAT_TWO);
+	err = dspio_set_uint_param(codec, 0x80, 0x0d, FLOAT_ZERO);
+	if (err < 0)
+		return err;
+	err = dspio_set_uint_param(codec, 0x80, 0x0e, FLOAT_ZERO);
+	if (err < 0)
+		return err;
+	err = dspio_set_uint_param(codec, 0x96, 0x3c, FLOAT_ZERO);
+	if (err < 0)
+		return err;
+	err = dspio_set_uint_param(codec, 0x31, 0x00, FLOAT_TWO);
+	if (err < 0)
+		return err;
+	err = dspio_set_uint_param(codec, 0x32, 0x00, FLOAT_TWO);
+	if (err < 0)
+		return err;
 	chipio_set_conn_rate(codec, MEM_CONNID_WUH, SR_48_000);
+	return 0;
 }
 
 /*
@@ -10950,20 +11173,30 @@ out:
  * bit1 set) even though the DAC was locked and unmuted. These are the exact
  * values Windows sends.
  */
-static void ae9_dsp_output_connect(struct hda_codec *codec)
+static int ae9_dsp_output_connect(struct hda_codec *codec)
 {
-	dspio_set_uint_param(codec, 0x32, 0x03, 0xc1280000);	/* -10.5 */
-	dspio_set_uint_param(codec, 0x32, 0x04, 0xc1280000);	/* -10.5 */
-	dspio_set_uint_param(codec, 0x32, 0x02, FLOAT_ZERO);
+	int err;
+
+	err = dspio_set_uint_param(codec, 0x32, 0x03, 0xc1280000); /* -10.5 */
+	if (err < 0)
+		return err;
+	err = dspio_set_uint_param(codec, 0x32, 0x04, 0xc1280000); /* -10.5 */
+	if (err < 0)
+		return err;
+	err = dspio_set_uint_param(codec, 0x32, 0x02, FLOAT_ZERO);
+	if (err < 0)
+		return err;
+	return 0;
 }
 
-static void ae9_setup_defaults(struct hda_codec *codec)
+static int ae9_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
-	int num_fx, idx, i;
+	int num_fx, idx, i, err;
+	const char *stage = "master-control/overlay";
 
 	if (spec->dsp_state != DSP_DOWNLOADED)
-		return;
+		return -EIO;
 
 	/*
 	 * Windows order (register capture 2026-09-03), NOT ae5_setup_defaults:
@@ -10971,43 +11204,69 @@ static void ae9_setup_defaults(struct hda_codec *codec)
 	 * the master-control "go", module defaults and ASI/PLL/port routing must
 	 * all be in place before any stream runs.
 	 */
-	ae9_dsp_scp_startup(codec);		/* W1: DSP master-control "go" */
+	err = ae9_dsp_scp_startup(codec);
+	if (err < 0)
+		goto fail;
 	if (ae9_mic)
 		ca0132_alt_init_analog_mics(codec);
-	ae9_dsp_defaults(codec);		/* W2: module defaults, no streams */
+	stage = "module defaults";
+	err = ae9_dsp_defaults(codec);
+	if (err < 0)
+		goto fail;
 	ae9_post_dsp_d0_prepare(codec);		/* W3: pins, ACM power, DAC mute */
 	ae9_post_dsp_asi_pll_setup(codec);	/* W4: ASI/PLL, then start streams */
-	ae9_dsp_output_connect(codec);	/* W4b: module 0x37 output routing (Windows) */
+	stage = "output connection";
+	err = ae9_dsp_output_connect(codec);
+	if (err < 0)
+		goto fail;
 	ae9_post_dsp_dac_init(codec);		/* W5: ES9038 + SABRE registers */
 	ae9_post_dsp_finish(codec);		/* W6: LED, unmute */
 	if (ae9_mic)
 		ca0132_alt_dsp_initial_mic_setup(codec);
 
 	/* W10: effects + speaker-tuning defaults, as Windows does after unmute */
+	stage = "effect defaults";
 	num_fx = OUT_EFFECTS_COUNT + IN_EFFECTS_COUNT + 1;
-	for (idx = 0; idx < num_fx; idx++)
-		for (i = 0; i <= ca0132_effects[idx].params; i++)
-			dspio_set_uint_param(codec,
-					ca0132_effects[idx].mid,
-					ca0132_effects[idx].reqs[i],
-					ca0132_effects[idx].def_vals[i]);
+	for (idx = 0; idx < num_fx; idx++) {
+		for (i = 0; i <= ca0132_effects[idx].params; i++) {
+			err = dspio_set_uint_param(codec,
+						   ca0132_effects[idx].mid,
+						   ca0132_effects[idx].reqs[i],
+						   ca0132_effects[idx].def_vals[i]);
+			if (err < 0)
+				goto fail;
+		}
+	}
 	ca0132_alt_init_speaker_tuning(codec);
-	dspio_set_uint_param(codec, 0x8f, 0x01, FLOAT_ZERO);
+	stage = "EQ bypass";
+	err = dspio_set_uint_param(codec, 0x8f, 0x01, FLOAT_ZERO);
+	if (err < 0)
+		goto fail;
 
 	spec->ae9_dsp_vol_zeroed = false;
-	ae9_dsp_volume_unity(codec);		/* before any stream can latch it */
+	stage = "unity volume";
+	err = ae9_dsp_volume_unity(codec);
+	if (err < 0)
+		goto fail;
 	/* W10 just wrote Windows' effect defaults (Surround/Crystalizer/Smart
 	 * Volume/X-Bass ENABLED); apply the mixer's switch states now, before any
 	 * stream opens, since the DSP latches them at stream start. */
+	stage = "effect switches";
 	for (idx = OUT_EFFECT_START_NID - EFFECT_START_NID, i = OUT_EFFECT_START_NID;
-	     i < OUT_EFFECT_END_NID; i++, idx++)
-		ca0132_effects_set(codec, i, spec->effects_switch[idx]);
+	     i < OUT_EFFECT_END_NID; i++, idx++) {
+		err = ca0132_effects_set(codec, i, spec->effects_switch[idx]);
+		if (err < 0)
+			goto fail;
+	}
 	codec_info(codec, "AE-9: converter bring-up done (capture-based, OutFX %s)\n",
 		   spec->effects_switch[PLAY_ENHANCEMENT - EFFECT_START_NID] ? "on" : "off");
 	ae9_dump_dsp_output_state(codec, "idle after bring-up");
-	ae9_acm_start(spec, msecs_to_jiffies(500));
-}
+	return 0;
 
+fail:
+	codec_err(codec, "AE-9: %s failed: %d\n", stage, err);
+	return err;
+}
 static void ae7_setup_defaults(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -12173,12 +12432,30 @@ static void ca0132_alt_init(struct hda_codec *codec)
 	}
 }
 
+static int ae9_dsp_init_failed(struct hda_codec *codec, int err)
+{
+	struct ca0132_spec *spec = codec->spec;
+
+	spec->dsp_state = DSP_DOWNLOAD_FAILED;
+	spec->ae9_dsp_vol_zeroed = false;
+	ae9_acm_stop(spec, false);
+	/* Best effort: the DAC command API has no acknowledgment. */
+	ae9_dac_write(codec, 0x07, 0x81);
+	ae9_dev49_write(codec, 0x0a, 0x07);
+	codec_err(codec, "AE-9: DSP initialization failed: %d\n", err);
+	return err;
+}
+
 static int ca0132_init(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 	struct auto_pin_cfg *cfg = &spec->autocfg;
-	int i;
+	int i, err;
 	bool dsp_loaded;
+
+	if (ca0132_quirk(spec) == QUIRK_AE9 &&
+	    spec->dsp_state == DSP_DOWNLOAD_FAILED)
+		return -EIO;
 
 	/*
 	 * If the DSP is already downloaded, and init has been entered again,
@@ -12212,6 +12489,14 @@ static int ca0132_init(struct hda_codec *codec)
 		ca0132_mmio_init(codec);
 
 	CLASS(snd_hda_power_pm, pm)(codec);
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		err = ae9_pm_error(codec, pm.err);
+		if (err < 0) {
+			spec->dsp_state = DSP_DOWNLOAD_FAILED;
+			spec->ae9_dsp_vol_zeroed = false;
+			return err;
+		}
+	}
 
 	if ((ca0132_quirk(spec) == QUIRK_AE5 || ca0132_quirk(spec) == QUIRK_AE9) || ca0132_quirk(spec) == QUIRK_AE7)
 		ae5_register_set(codec);
@@ -12241,7 +12526,9 @@ static int ca0132_init(struct hda_codec *codec)
 		ae5_setup_defaults(codec);
 		break;
 	case QUIRK_AE9:
-		ae9_setup_defaults(codec);
+		err = ae9_setup_defaults(codec);
+		if (err < 0)
+			return ae9_dsp_init_failed(codec, err);
 		break;
 	case QUIRK_AE7:
 		ae7_setup_defaults(codec);
@@ -12276,7 +12563,9 @@ static int ca0132_init(struct hda_codec *codec)
 
 	snd_hda_sequence_write(codec, spec->spec_init_verbs);
 	if (ca0132_use_alt_functions(spec)) {
-		ca0132_alt_select_out(codec);
+		err = ca0132_alt_select_out(codec);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return ae9_dsp_init_failed(codec, err);
 		ca0132_alt_select_in(codec);
 	} else {
 		ca0132_select_out(codec);
@@ -12291,8 +12580,13 @@ static int ca0132_init(struct hda_codec *codec)
 	 */
 	if (spec->dsp_reload) {
 		spec->dsp_reload = false;
-		ca0132_pe_switch_set(codec);
+		err = ca0132_pe_switch_set(codec);
+		if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0)
+			return ae9_dsp_init_failed(codec, err);
 	}
+
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		ae9_acm_start(spec, msecs_to_jiffies(500));
 
 	return 0;
 }
@@ -12894,7 +13188,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
