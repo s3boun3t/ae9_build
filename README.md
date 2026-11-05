@@ -133,3 +133,5 @@ personnels ne sont pas distribués.
 - `dead` : Supprimer le diagnostic différé jamais planifié et son état privé. Le dump actif de démarrage reste présent.
 
 - `acmfix1` : Vérifier enveloppe, opcode, taille, direction et terminaison des réponses ACM avant toute action ALSA. Préserver les octets F7 présents dans les données.
+
+- `filterfix1` : Exposer les sept filtres ES9038Q2M valides et préserver la consigne lors des changements de sortie et de muet.

@@ -850,6 +850,25 @@ static const struct ae5_filter_set ae5_filter_presets[] = {
 	}
 };
 
+#define AE9_DAC_FILTER_MASK	0xe0
+#define AE9_DAC_FILTER_DEFAULT	0x80
+
+/* ES9038Q2M register 7, bits 7:5; encoding 5 is reserved. */
+struct ae9_filter_set {
+	const char *name;
+	u8 val;
+};
+
+static const struct ae9_filter_set ae9_filter_presets[] = {
+	{ "Linear Phase Fast Roll Off", 0x00 },
+	{ "Linear Phase Slow Roll Off", 0x20 },
+	{ "Minimum Phase Fast Roll Off", 0x40 },
+	{ "Minimum Phase Slow Roll Off", 0x60 },
+	{ "Apodizing Fast Roll Off", 0x80 },
+	{ "Corrected Minimum Phase Fast Roll Off", 0xc0 },
+	{ "Brick Wall", 0xe0 },
+};
+
 /*
  * Data structures for storing audio router remapping data. These are used to
  * remap a currently active streams ports.
@@ -1194,6 +1213,9 @@ struct ca0132_spec {
 	/* AE-5 Control values */
 	unsigned char ae5_headphone_gain_val;
 	unsigned char ae5_filter_val;
+	/* AE-9 DAC register 7 command state, not hardware readback. */
+	struct mutex ae9_dac_mutex;
+	u8 ae9_dac_reg7;
 	/* ZxR Control Values */
 	unsigned char zxr_gain_set;
 
@@ -6268,6 +6290,72 @@ static int ae5_sound_filter_put(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
+static void ae9_dac_init_state(struct ca0132_spec *spec)
+{
+	mutex_init(&spec->ae9_dac_mutex);
+	spec->ae9_dac_reg7 = AE9_DAC_FILTER_DEFAULT;
+}
+
+static int ae9_sound_filter_info(struct snd_kcontrol *kcontrol,
+				 struct snd_ctl_elem_info *uinfo)
+{
+	unsigned int sel = uinfo->value.enumerated.item;
+
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
+	uinfo->count = 1;
+	uinfo->value.enumerated.items = ARRAY_SIZE(ae9_filter_presets);
+	if (sel >= ARRAY_SIZE(ae9_filter_presets))
+		sel = ARRAY_SIZE(ae9_filter_presets) - 1;
+	uinfo->value.enumerated.item = sel;
+	strscpy(uinfo->value.enumerated.name, ae9_filter_presets[sel].name);
+	return 0;
+}
+
+static int ae9_sound_filter_get(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int i;
+
+	guard(mutex)(&spec->ae9_dac_mutex);
+	for (i = 0; i < ARRAY_SIZE(ae9_filter_presets); i++) {
+		if (ae9_filter_presets[i].val !=
+		    (spec->ae9_dac_reg7 & AE9_DAC_FILTER_MASK))
+			continue;
+		ucontrol->value.enumerated.item[0] = i;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int ae9_sound_filter_put(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_value *ucontrol)
+{
+	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+	struct ca0132_spec *spec = codec->spec;
+	unsigned int sel = ucontrol->value.enumerated.item[0];
+	u8 value;
+
+	if (sel >= ARRAY_SIZE(ae9_filter_presets))
+		return -EINVAL;
+
+	CLASS(snd_hda_power_pm, pm)(codec);
+	if (pm.err < 0)
+		return pm.err;
+
+	guard(mutex)(&spec->ae9_dac_mutex);
+	value = (spec->ae9_dac_reg7 & ~AE9_DAC_FILTER_MASK) |
+		ae9_filter_presets[sel].val;
+	if (value == spec->ae9_dac_reg7)
+		return 0;
+
+	/* Use the AE-9 DAC write path; preserve mute and OSF bypass. */
+	ca0113_mmio_command_set(codec, 0x48, 0x07, value);
+	spec->ae9_dac_reg7 = value;
+	return 1;
+}
+
 /*
  * Input Select Control for alternative ca0132 codecs. This exists because
  * front microphone has no auto-detect, and we need a way to set the rear
@@ -7308,6 +7396,19 @@ static int ae5_add_sound_filter_enum(struct hda_codec *codec)
 				snd_ctl_new1(&knew, codec));
 }
 
+static int ae9_add_sound_filter_enum(struct hda_codec *codec)
+{
+	struct snd_kcontrol_new knew =
+		HDA_CODEC_MUTE_MONO("AE-9: DAC Filter",
+				    AE5_SOUND_FILTER_ENUM, 1, 0, HDA_OUTPUT);
+
+	knew.info = ae9_sound_filter_info;
+	knew.get = ae9_sound_filter_get;
+	knew.put = ae9_sound_filter_put;
+	return snd_hda_ctl_add(codec, AE5_SOUND_FILTER_ENUM,
+				snd_ctl_new1(&knew, codec));
+}
+
 static int zxr_add_headphone_gain_switch(struct hda_codec *codec)
 {
 	struct snd_kcontrol_new knew =
@@ -7617,7 +7718,10 @@ static int ca0132_build_controls(struct hda_codec *codec)
 		err = ae5_add_headphone_gain_enum(codec);
 		if (err < 0)
 			return err;
-		err = ae5_add_sound_filter_enum(codec);
+		if (ca0132_quirk(spec) == QUIRK_AE9)
+			err = ae9_add_sound_filter_enum(codec);
+		else
+			err = ae5_add_sound_filter_enum(codec);
 		if (err < 0)
 			return err;
 		break;
@@ -8900,7 +9004,19 @@ static void ae5_setup_defaults(struct hda_codec *codec)
  */
 static void ae9_dac_write(struct hda_codec *codec, unsigned int reg, unsigned int val)
 {
+	struct ca0132_spec *spec = codec->spec;
+
+	if (reg != 0x07) {
+		ca0113_mmio_command_set(codec, 0x48, reg, val);
+		return;
+	}
+
+	/* Serialize filter requests with the existing mute/unmute commands. */
+	guard(mutex)(&spec->ae9_dac_mutex);
+	val = (val & ~AE9_DAC_FILTER_MASK) |
+		(spec->ae9_dac_reg7 & AE9_DAC_FILTER_MASK);
 	ca0113_mmio_command_set(codec, 0x48, reg, val);
+	spec->ae9_dac_reg7 = val;
 }
 
 static void ae9_dev49_write(struct hda_codec *codec, unsigned int reg, unsigned int val)
@@ -9340,7 +9456,7 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 	{
 		static const struct { const char *name; unsigned int grp, reg; } dr[] = {
 			{ "ES9038 0x01 input (want c0)",  0x48, 0x01 },
-			{ "ES9038 0x07 mute (want 80)",   0x48, 0x07 },
+			{ "ES9038 0x07 filter/mute",      0x48, 0x07 },
 			{ "ES9038 0x0a (want 02)",        0x48, 0x0a },
 			{ "ES9038 0x0b (want 20)",        0x48, 0x0b },
 			{ "ES9038 0x0c dpll (want 5f)",   0x48, 0x0c },
@@ -12629,6 +12745,7 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 		snd_hda_codec_set_name(codec, "Sound BlasterX AE-5");
 		break;
 	case QUIRK_AE9:
+		ae9_dac_init_state(spec);
 		/* Replace only the Front pair; keep the other desktop controls. */
 		spec->mixers[0] = ae9_shared_mixer;
 		spec->mixers[1] = desktop_mixer + 2;
@@ -12774,7 +12891,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
