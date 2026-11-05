@@ -129,3 +129,5 @@ Sa valeur par défaut reste zéro. Les scripts de mesure et les outils
 personnels ne sont pas distribués.
 
 - `clockdiag3` : Conserver séparément le diagnostic opt-in employé par les variantes réellement essayées. Désactivé par défaut, il ne corrige ni ne reprogramme les fréquences audio.
+
+- `dead` : Supprimer le diagnostic différé jamais planifié et son état privé. Le dump actif de démarrage reste présent.

@@ -1162,7 +1162,6 @@ struct ca0132_spec {
 	unsigned int scp_resp_data[4];
 	unsigned int scp_resp_count;
 	bool ae9_loader_ctx;	/* AE-9: DMA alloc/free with SCP src 0x00 (loader) */
-	bool ae9_dumped;	/* AE-9: DSP output-DMA state already logged once */
 	bool ae9_dsp_loader;	/* AE-9: dspxfr via the DSP's own loader (0x3a/0x3b), no host DSPDMAC writes */
 	bool startup_check_entered;
 	bool dsp_reload;
@@ -1200,7 +1199,6 @@ struct ca0132_spec {
 
 	struct hda_codec *codec;
 	struct delayed_work unsol_hp_work;
-	struct delayed_work ae9_dump_work;	/* AE-9: mid-playback DSP/DAC dump */
 	struct delayed_work ae9_acm_work;	/* AE-9: 500 ms ACM service (keepalive, knob, display) */
 	spinlock_t ae9_acm_work_lock;
 	bool ae9_acm_active;
@@ -4207,14 +4205,6 @@ static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
 	snd_hda_codec_setup_stream(codec, spec->dacs[0], stream_tag, 0, format);
 	ae9_clock_diag_request(codec, format);
 
-	/*
-	 * The DSP-state/automute diagnostic work used to be scheduled here; it
-	 * hammered the ca0113 command engine on the shared BAR2 ~800 ms into
-	 * playback and corrupted the ACM's UART probe (which lives on the same
-	 * BAR2). Its job is done -- it proved the DSP-silence fix -- so it is no
-	 * longer scheduled. ae9_dump_work / ae9_dump_dsp_output_state remain
-	 * defined for manual re-enable if ever needed.
-	 */
 	return 0;
 }
 
@@ -9372,38 +9362,6 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 	}
 }
 
-/*
- * AE-9 decisive test: does the DSP emit REAL AUDIO or SILENCE to the ES9038?
- * Enable the ES9038's own automute (level -60 dB, config=mute-on-condition,
- * time!=0) WHILE a loud tone is streaming, wait past automute_time, and read
- * automute_status (Register 64 bit 1). Our 440 Hz tone is ~-8 dB: if the DSP is
- * passing it, the DAC input stays ABOVE -60 dB -> automute does NOT trip
- * (status 0) -> the DAC is receiving real audio and the fault is analog/
- * downstream. If the DSP is passing zeros, the input is below -60 dB ->
- * automute trips (status 1) -> the silence is a DSP-internal routing bug.
- * Restores automute regs afterwards (reg4=0 disables it).
- */
-static void ae9_automute_probe(struct hda_codec *codec)
-{
-	unsigned int before, after;
-
-	before = ca0113_mmio_command_get(codec, 0x48, 0x40);
-	ae9_dac_write(codec, 0x05, 0x3c);	/* automute_level = -60 dB */
-	ae9_dac_write(codec, 0x04, 0xff);	/* automute_time != 0 -> ~0.17 s */
-	ae9_dac_write(codec, 0x02, 0x74);	/* [7:6]=01 mute-on-automute (rest default) */
-	msleep(400);
-	after = ca0113_mmio_command_get(codec, 0x48, 0x40);
-	ae9_dac_write(codec, 0x02, 0x34);	/* restore reg2 default */
-	ae9_dac_write(codec, 0x04, 0x00);	/* disable automute */
-	ae9_dac_write(codec, 0x05, 0x68);	/* restore level default -104 dB */
-	codec_info(codec,
-		   "AE-9 AUTOMUTE PROBE: reg64 %02x->%02x automute_status=%u lock=%u => DSP output is %s\n",
-		   before, after, (after >> 1) & 1, after & 1,
-		   ((after >> 1) & 1) ?
-		   "SILENCE (DSP emits zeros -> internal routing bug, NOT analog)" :
-		   "REAL AUDIO (DAC has signal -> fault is the analog stage/downstream)");
-}
-
 /* ---- AE-9 Audio Control Module (ACM): 16550 UART at BAR2+0xc00, 4-byte
  * register stride, 115200 8N1, sysex-style frames F0 .. F7. Protocol from the
  * Windows driver RE (reference/ctxhda-acm-analysis.md). Everything below runs
@@ -10836,23 +10794,6 @@ out:
 	}
 }
 
-static void ae9_dump_work_fn(struct work_struct *work)
-{
-	struct ca0132_spec *spec = container_of(to_delayed_work(work),
-						struct ca0132_spec, ae9_dump_work);
-	codec_info(spec->codec, "AE-9: converter nid 0x02 live stream tag = 0x%02x (want !=0)\n",
-		   snd_hda_codec_read(spec->codec, 0x02, 0, AC_VERB_GET_CONV, 0) >> 4);
-	ae9_automute_probe(spec->codec);
-	if (spec->ae9_dumped)
-		return;		/* full register dump only once per boot */
-	spec->ae9_dumped = true;
-
-	/* Fires ~0.8 s into the first stream, when the HDA DMA is actually
-	 * running (prepare only ARMS it) and the ES9038 DPLL should be locked.
-	 * This is the read that separates "no clock" from "I2C never landed". */
-	ae9_dump_dsp_output_state(spec->codec, "mid playback +0.8s");
-}
-
 /*
  * AE-9: connect the DSP output routing. Windows programs module 0x37 (the DSP
  * output routing / loopback module) and finishes module 0x32 right after it
@@ -12229,7 +12170,6 @@ static void ca0132_free(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
-	cancel_delayed_work_sync(&spec->ae9_dump_work);
 	ae9_acm_stop(spec, true);
 	snd_hda_power_up(codec);
 	switch (ca0132_quirk(spec)) {
@@ -12719,7 +12659,6 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 	spec->base_exit_verbs = ca0132_base_exit_verbs;
 
 	INIT_DELAYED_WORK(&spec->unsol_hp_work, ca0132_unsol_hp_delayed);
-	INIT_DELAYED_WORK(&spec->ae9_dump_work, ae9_dump_work_fn);
 	INIT_DELAYED_WORK(&spec->ae9_acm_work, ae9_acm_work_fn);
 
 	ca0132_init_chip(codec);
@@ -12778,7 +12717,6 @@ static int ca0132_codec_suspend(struct hda_codec *codec)
 	struct ca0132_spec *spec = codec->spec;
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
-	cancel_delayed_work_sync(&spec->ae9_dump_work);
 	ae9_acm_stop(spec, false);
 	spec->ae9_acm_present = false;	/* re-probe the ACM after resume */
 	return 0;
@@ -12805,7 +12743,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-auditdead1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
