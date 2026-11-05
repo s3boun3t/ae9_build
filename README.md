@@ -141,3 +141,5 @@ personnels ne sont pas distribués.
 - `dspfix2` : Propager les erreurs DMA, loader et overlay. Arrêter proprement une initialisation échouée et limiter l’exception PM EACCES au probe avant enregistrement et activation runtime-PM.
 
 - `shutdownfix1` : Utiliser les DAC, GPIO et flux propres à l’AE-9 pour mettre la carte et l’ACM au repos, sans reprendre les commandes d’arrêt AE-5.
+
+- `cleanup1` : Corriger les commentaires de configuration et les noms trompeurs sans modifier les transactions matérielles.

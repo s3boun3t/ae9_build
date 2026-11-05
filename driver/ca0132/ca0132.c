@@ -25,11 +25,12 @@
 #include <linux/spinlock.h>
 #include <linux/unaligned.h>
 
-/* AE-9 ACM service mode. 0 (default) = initialise the module once (unlock,
- * headphone amp on, display) and then leave it alone: no keepalive, no knob
- * polling, no register reads during playback. 1 = the full Windows-style
- * 500 ms service (knob, display, keepalive). Baseline for stability first:
- * every dropout/freeze on 2026-09-08 coincided with the live service. */
+/*
+ * AE-9 ACM service mode. 1 (default) enables live knob, display, button
+ * and keepalive service. 0 initialises the ACM once, then parks service.
+ * The worker schedules service, display and optional clock diagnostics;
+ * this is not an unconditional 500 ms register-polling loop.
+ */
 static int ae9_acm_poll = 1;
 module_param(ae9_acm_poll, int, 0644);
 MODULE_PARM_DESC(ae9_acm_poll, "AE-9 ACM: 1 = live knob/display/button service (default), 0 = init once and stay quiet");
@@ -9207,7 +9208,11 @@ static void ae9_chip_ctrl_725(struct hda_codec *codec)
 	}
 }
 
-static void ae9_pll_set(struct hda_codec *codec)
+/*
+ * Replay the captured 8051 register sequence through the PLL/PMU interface.
+ * These values do not establish a divider model or a physical MCLK rate.
+ */
+static void ae9_apply_8051_reg_sequence(struct hda_codec *codec)
 {
 	static const unsigned int addr[] = { 0x44, 0x43, 0x45, 0x40, 0x42, 0x41, 0x51 };
 	static const unsigned int data[] = { 0xc8, 0xcc, 0xcb, 0xc7, 0xcd, 0xce, 0xdb };
@@ -9228,16 +9233,13 @@ static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 	chipio_set_control_param(codec, CONTROL_PARAM_ASI, 0);
 	snd_hda_codec_write(codec, 0x17, 0, 0x794, 0x00);
 	chipio_8051_write_exram(codec, 0xfa92, 0x22);
-	ae9_pll_set(codec);
+	ae9_apply_8051_reg_sequence(codec);
 	ae9_chip_ctrl_725(codec);
 	ae9_gpio_cmd(spec, 0x0001);		/* GPIO 1 = 0: 192 kHz select off */
 	/*
-	 * Windows raises GPIO 4 here (0x104) in phase 4 AND in the phase-9
-	 * playback re-init, in the pattern 0x105,0x104,0x105 (capture bar2). No
-	 * Linux path (driver or poke.sh) ever drove pin 4. With the DSP->DAC
-	 * digital chain proven live and the ACM amp audibly clicking yet silent,
-	 * a card GPIO that Windows only asserts around stream start is the
-	 * signature of an analog output enable/relay.
+	 * Replay the captured 0x105,0x104,0x105 GPIO command order from
+	 * Windows phases 4 and 9. An analog enable/relay role for GPIO4
+	 * remains a hypothesis, not a confirmed signal assignment.
 	 */
 	ae9_gpio_cmd(spec, 0x0105);
 	ae9_gpio_cmd(spec, 0x0104);		/* GPIO 4 = 1 (Windows; analog out enable?) */
@@ -9245,10 +9247,9 @@ static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 
 	chipio_set_conn_rate(codec, 0x70, SR_96_000);
 	/*
-	 * ca0132_alt_start_dsp_audio_streams discipline (every working card does
-	 * this; the AE-9 path skipped it): no stream running and no stale DSP DMA
-	 * channel active BEFORE the audio streams start, and give the DSP time to
-	 * set up each DMA channel.
+	 * Stop streams 0x0c/0x18 and release active DSP DMA channels before
+	 * starting the playback streams. Allow DSP DMA setup time after each
+	 * start, following ca0132_alt_start_dsp_audio_streams().
 	 */
 	chipio_set_stream_control(codec, 0x0c, 0);
 	chipio_set_stream_control(codec, 0x18, 0);
@@ -9258,7 +9259,7 @@ static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 	msleep(75);
 	chipio_set_stream_source_dest(codec, 0x05, 0x43, 0x00);
 	chipio_set_stream_channels(codec, 0x05, 2);	/* stereo HDA-input stream */
-	chipio_set_stream_control(codec, 0x05, 1);	/* routed but never STARTED before */
+	chipio_set_stream_control(codec, 0x05, 1);	/* start the DSP input */
 	msleep(75);
 	chipio_set_stream_source_dest(codec, 0x18, 0x09, 0xd0);
 	chipio_set_conn_rate(codec, 0xd0, SR_96_000);
@@ -9278,7 +9279,7 @@ static void ae9_post_dsp_asi_pll_setup(struct hda_codec *codec)
 	chipio_write(codec, 0x189028, 0x0002000f);
 	ae9_dac_write(codec, 0x01, 0xc0);	/* ES9038 input: 32-bit I2S */
 	ae9_dac_write(codec, 0x0a, 0x02);
-	ae9_pll_set(codec);
+	ae9_apply_8051_reg_sequence(codec);
 	chipio_set_control_param(codec, CONTROL_PARAM_ASI, 0xf);
 }
 
@@ -9313,12 +9314,12 @@ static void ae9_post_dsp_dac_init(struct hda_codec *codec)
 		ae9_dev49_write(codec, d49_reg[i], d49_val[i]);
 }
 
-/* D0.6 / D0.7: internal LED, then unmute */
+/* D0.6 / D0.7: captured GPIO4 command, DAC unmute and THD registers */
 static void ae9_post_dsp_finish(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
-	ae9_gpio_cmd(spec, 0x0104);		/* GPIO 4 = 1: internal LED */
+	ae9_gpio_cmd(spec, 0x0104);		/* GPIO4 high, as captured */
 	ae9_dac_write(codec, 0x07, 0x80);	/* ES9038: unmute */
 	/*
 	 * Windows unmutes the SABRE9006 (dev 0x49, the 8-channel line-out DAC)
@@ -9332,7 +9333,7 @@ static void ae9_post_dsp_finish(struct hda_codec *codec)
 	ae9_dev49_write(codec, 0x05, 0x15);
 	ae9_dev49_write(codec, 0x02, 0x15);
 	ae9_dev49_write(codec, 0x03, 0x15);
-	/* headphone-mode THD table (DAC mode 3): 0x19 = 1, rest 0 */
+	/* Clear the THD-related registers, including 0x19 = 0x00. */
 	ae9_dac_write(codec, 0x0d, 0x00);
 	ae9_dac_write(codec, 0x16, 0x00);
 	ae9_dac_write(codec, 0x17, 0x00);
@@ -9347,8 +9348,9 @@ static void ae9_post_dsp_finish(struct hda_codec *codec)
  * ops:2084-2196); this is the only DSP-side "go" sequence in the whole trace,
  * and the 7.0 driver had nothing equivalent, so the DSP output pipeline never
  * activated. Between states 3 and 4 Windows DMA-loads a small XRAM overlay to
- * 0x3f3a0 (the output-connect patch, embedded below); we load it too. Every
- * GET is a poll whose reply we discard.
+ * 0x3f3a0 (the output-connect patch, loaded from AE9_OVERLAY_FW).
+ * GET replies are logged and size-checked; asynchronous replies are not
+ * required to equal the requested state.
  */
 /*
  * AE-9 DSP output-connect overlay: a 432-byte DSP program patch (39
@@ -9549,12 +9551,10 @@ out:
 
 /*
  * W2: DSP module defaults before the analog bring-up (ops:2198-2232).
- * Unlike ae5_setup_defaults this starts NO DSP audio stream, frees no DMA
- * channel and never touches the ca0113 group-0x30 device or streams 0x03/0x04;
- * those are the operations Windows never issues on this board, and starting a
- * stream before the ASI/PLL routing exists is what left the output pipeline
- * frozen. Streams are started later, after the routing, in
- * ae9_post_dsp_asi_pll_setup().
+ * This stage starts no DSP stream, frees no DMA channel and issues no
+ * group-0x30 command. Playback streams are started later by
+ * ae9_post_dsp_asi_pll_setup(). Shared mic setup can also start streams
+ * 0x03/0x04 in other AE-9 initialisation stages.
  */
 static int ae9_dsp_defaults(struct hda_codec *codec)
 {
@@ -9603,11 +9603,10 @@ static int ae9_dsp_defaults(struct hda_codec *codec)
 }
 
 /*
- * AE-9 diagnostic: dump the DSP output-DMA / run-state / port-enable block via
- * the driver's own chipio_read (proven reliable in-driver, unlike userspace
- * hwdep verbs which read 0xffffffff on a runtime-suspended codec). s3boun3t's
- * wall was "DSP output DMA channels frozen, ACTIVE=0" — this makes that bit,
- * and the port enables, visible in dmesg. Read-only; safe to call anytime.
+ * Active AE-9 bring-up diagnostic for DSP, routing and DAC state. Reads use
+ * ChipIO/8051 selectors and DAC transport commands, including writes to
+ * the 8051 selector at 0xce. Keep calls in the powered bring-up path;
+ * this is not a passive snapshot safe to call at arbitrary times.
  */
 static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
 {
@@ -11165,13 +11164,9 @@ out:
 }
 
 /*
- * AE-9: connect the DSP output routing. Windows programs module 0x37 (the DSP
- * output routing / loopback module) and finishes module 0x32 right after it
- * raises ASI to 15 (register capture ops:2505-2507, 2726-2770). Our AE-9 path
- * never touched module 0x37 at all, which left the DSP output pipeline fed from
- * silence -- PROVEN by the ES9038 automute tripping on a loud stream (reg64
- * bit1 set) even though the DAC was locked and unmuted. These are the exact
- * values Windows sends.
+ * AE-9: apply the existing module-0x32 output parameters: requests 0x03/0x04
+ * at -10.5 dB and request 0x02 at FLOAT_ZERO. This helper sends no module-0x37
+ * command; other routing and overlay stages are handled separately.
  */
 static int ae9_dsp_output_connect(struct hda_codec *codec)
 {
@@ -11220,7 +11215,7 @@ static int ae9_setup_defaults(struct hda_codec *codec)
 	if (err < 0)
 		goto fail;
 	ae9_post_dsp_dac_init(codec);		/* W5: ES9038 + SABRE registers */
-	ae9_post_dsp_finish(codec);		/* W6: LED, unmute */
+	ae9_post_dsp_finish(codec);		/* W6: GPIO4, DAC unmute */
 	if (ae9_mic)
 		ca0132_alt_dsp_initial_mic_setup(codec);
 
@@ -13303,7 +13298,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
