@@ -11833,6 +11833,110 @@ static void r3d_exit_chip(struct hda_codec *codec)
 	snd_hda_codec_write(codec, 0x01, 0, 0x794, 0x5b);
 }
 
+/* Called after the ACM workers have stopped, while the codec is powered. */
+static int ae9_acm_power_down(struct ca0132_spec *spec)
+{
+	static const u8 frame[] = { 0xf0, 0x52, 0x02, 0xcc, 0xdd, 0xf7 };
+	void __iomem *b2 = spec->mem_base;
+	u32 status;
+	int i, w;
+
+	if (!spec->ae9_acm_present)
+		return 0;
+
+	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
+		(void)readb(b2 + AE9_U_RBR);
+	for (i = 0; i < ARRAY_SIZE(frame); i++) {
+		for (w = 0; w < 100; w++) {
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U)
+				return -ENODEV;
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+		}
+		/* Do not continue or retry a partially transmitted frame. */
+		if (w == 100)
+			return -ETIMEDOUT;
+		writeb(frame[i], b2 + AE9_U_THR);
+		readb(b2 + AE9_U_LCR);
+	}
+
+	/* Finish transmitting before GPIO5 removes the ACM supply. */
+	for (w = 0; w < 100; w++) {
+		status = readl(b2 + AE9_U_STS);
+		if (status == ~0U)
+			return -ENODEV;
+		if (!(status & 0x01))
+			return 0;
+		usleep_range(50, 100);
+	}
+	return -ETIMEDOUT;
+}
+
+static void ae9_exit_chip(struct hda_codec *codec)
+{
+	static const hda_nid_t pins[] = { 0x11, 0x12, 0x13, 0x0b, 0x0f, 0x10 };
+	struct ca0132_spec *spec = codec->spec;
+	int err, i;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 || !spec->mem_base ||
+	    spec->dsp_state != DSP_DOWNLOADED)
+		return;
+
+	/* The shared mic setup also starts streams 3/4 on the AE-9. */
+	chipio_set_stream_control(codec, 0x03, 0);
+	chipio_set_stream_control(codec, 0x04, 0);
+	/* Reverse the AE-9 playback stream startup. */
+	chipio_set_stream_control(codec, 0x18, 0);
+	msleep(50);
+	chipio_set_stream_control(codec, 0x05, 0);
+	msleep(50);
+
+	err = ae9_acm_power_down(spec);
+	if (err)
+		codec_warn(codec, "AE-9 ACM power-down TX failed: %d\n", err);
+
+	chipio_set_control_param(codec, CONTROL_PARAM_ASI, 0);
+	chipio_set_stream_control(codec, 0x0c, 0);
+	msleep(50);
+
+	/* Windows power-down order, without its controller/secondary writes. */
+	ae9_gpio_cmd(spec, 0x01);
+	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0, 0x724, 0x83);
+	/* Keep the selected filter while asserting soft mute. */
+	ae9_dac_write(codec, 0x07, 0x01);
+	ae9_dev49_write(codec, 0x0a, 0x07);
+	ae9_gpio_cmd(spec, 0x04);
+	ae9_gpio_cmd(spec, 0x05);
+	ae9_gpio_cmd(spec, 0x03);
+
+	for (i = 0x11; i <= 0x14; i++)
+		ae9_dac_write(codec, i, 0x00);
+	ae9_dac_write(codec, 0x0f, 0xff);
+	ae9_dac_write(codec, 0x10, 0xff);
+	ae9_dac_write(codec, 0x0e, 0x0a);
+	ae9_dev49_write(codec, 0x02, 0xff);
+	ae9_dev49_write(codec, 0x04, 0xff);
+	ae9_dev49_write(codec, 0x03, 0xff);
+	ae9_dev49_write(codec, 0x05, 0xff);
+	ae9_gpio_cmd(spec, 0x00);
+	msleep(100);
+
+	for (i = 0; i < ARRAY_SIZE(pins); i++)
+		snd_hda_codec_write(codec, pins[i], 0,
+				    AC_VERB_SET_PIN_WIDGET_CONTROL, 0);
+	snd_hda_codec_write(codec, 0x0b, 0, AC_VERB_SET_EAPD_BTLENABLE, 0);
+	snd_hda_codec_write(codec, 0x01, 0, 0x793, 0x00);
+	snd_hda_codec_write(codec, 0x01, 0, 0x794, 0x53);
+
+	/* A surviving DSP marker must not bypass the full resume sequence. */
+	spec->dsp_state = DSP_DOWNLOAD_INIT;
+	spec->ae9_dsp_vol_zeroed = false;
+	spec->ae9_acm_present = false;
+	/* ALSA/HDA owns the final codec D3 transition and controller shutdown. */
+}
+
 static void ae5_exit_chip(struct hda_codec *codec)
 {
 	chipio_set_stream_control(codec, 0x03, 0);
@@ -12609,10 +12713,15 @@ static int dbpro_init(struct hda_codec *codec)
 static void ca0132_free(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
+	int err;
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	ae9_acm_stop(spec, true);
-	snd_hda_power_up(codec);
+	err = snd_hda_power_up(codec);
+	if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0) {
+		codec_warn(codec, "AE-9 remove: power-up failed: %d\n", err);
+		goto power_down;
+	}
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
 		sbz_exit_chip(codec);
@@ -12624,8 +12733,10 @@ static void ca0132_free(struct hda_codec *codec)
 		r3d_exit_chip(codec);
 		break;
 	case QUIRK_AE5:
-	case QUIRK_AE9:
 		ae5_exit_chip(codec);
+		break;
+	case QUIRK_AE9:
+		ae9_exit_chip(codec);
 		break;
 	case QUIRK_AE7:
 		ae7_exit_chip(codec);
@@ -12638,8 +12749,10 @@ static void ca0132_free(struct hda_codec *codec)
 	}
 
 	snd_hda_sequence_write(codec, spec->base_exit_verbs);
-	ca0132_exit_chip(codec);
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		ca0132_exit_chip(codec);
 
+power_down:
 	snd_hda_power_down(codec);
 	if (spec->ae9_pm_held)
 		pm_runtime_put_noidle(hda_codec_dev(codec));
@@ -13163,6 +13276,8 @@ static int ca0132_codec_suspend(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	ae9_acm_stop(spec, false);
+	if (ca0132_quirk(spec) == QUIRK_AE9)
+		ae9_exit_chip(codec);
 	spec->ae9_acm_present = false;	/* re-probe the ACM after resume */
 	return 0;
 }
@@ -13188,7 +13303,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

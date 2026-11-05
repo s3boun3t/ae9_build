@@ -139,3 +139,5 @@ personnels ne sont pas distribués.
 - `pmfix1` : Terminer la détection avant de prendre le maintien PM, afin de ne pas attribuer la référence AE-9 au codec secondaire DBPro.
 
 - `dspfix2` : Propager les erreurs DMA, loader et overlay. Arrêter proprement une initialisation échouée et limiter l’exception PM EACCES au probe avant enregistrement et activation runtime-PM.
+
+- `shutdownfix1` : Utiliser les DAC, GPIO et flux propres à l’AE-9 pour mettre la carte et l’ACM au repos, sans reprendre les commandes d’arrêt AE-5.
