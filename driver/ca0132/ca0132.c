@@ -1237,6 +1237,7 @@ struct ca0132_spec {
 	bool ae9_acm_ui_only;
 	bool ae9_acm_ui_pending;
 	unsigned long ae9_acm_service_due;
+	unsigned long ae9_acm_knob_due;
 	unsigned long ae9_acm_ui_due;
 	unsigned long ae9_acm_quiet_until;
 	unsigned int ae9_acm_refresh_log_left;
@@ -9732,12 +9733,14 @@ static void ae9_dump_dsp_output_state(struct hda_codec *codec, const char *when)
  * control hooks only set flags. ---- */
 #define AE9_ACM_UI_DELAY_MS 20
 #define AE9_ACM_QUIET_MS 50
+#define AE9_ACM_KNOB_POLL_MS 50
 
 enum ae9_acm_job {
 	AE9_ACM_JOB_NONE,
 	AE9_ACM_JOB_DISPLAY,
 	AE9_ACM_JOB_SERVICE,
 	AE9_ACM_JOB_CLOCK,
+	AE9_ACM_JOB_KNOB,
 };
 
 /* Caller holds work_lock. UI activity must never move service_due. */
@@ -9816,10 +9819,36 @@ static bool ae9_clock_diag_ready_locked(struct ca0132_spec *spec, u32 seq)
 		time_before(now + margin, spec->ae9_acm_service_due);
 }
 
+/* Idle C2 queries share the worker and leave room for the next service. */
+static unsigned long ae9_acm_next_knob_work_locked(struct ca0132_spec *spec)
+{
+	unsigned long now = jiffies, at = spec->ae9_acm_knob_due;
+	unsigned long due = spec->ae9_acm_service_due;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 || !READ_ONCE(ae9_acm_poll) ||
+	    !spec->ae9_acm_present || spec->ae9_acm_turbo ||
+	    spec->ae9_acm_dead_ticks ||
+	    READ_ONCE(spec->ae9_acm_pending_mode) ||
+	    spec->ae9_acm_knob_tx_failed ||
+	    READ_ONCE(spec->ae9_acm_tx_failed))
+		return due;
+	if (time_before(at, spec->ae9_acm_quiet_until))
+		at = spec->ae9_acm_quiet_until;
+	if (time_before(at, now))
+		at = now;
+	if (time_before(at + msecs_to_jiffies(AE9_ACM_QUIET_MS), due))
+		return at;
+	return due;
+}
+
 static unsigned long ae9_acm_next_work_locked(struct ca0132_spec *spec)
 {
-	return ae9_clock_diag_slot_locked(spec,
-					 ae9_acm_next_ui_work_locked(spec));
+	unsigned long due = ae9_acm_next_ui_work_locked(spec);
+	unsigned long knob = ae9_acm_next_knob_work_locked(spec);
+
+	if (time_before(knob, due))
+		due = knob;
+	return ae9_clock_diag_slot_locked(spec, due);
 }
 
 static void ae9_acm_queue_locked(struct ca0132_spec *spec)
@@ -9974,6 +10003,8 @@ static void ae9_acm_start(struct ca0132_spec *spec, unsigned long delay)
 		spec->ae9_acm_busy = false;
 		spec->ae9_acm_ui_only = false;
 		spec->ae9_acm_service_due = jiffies + delay;
+		spec->ae9_acm_knob_due = jiffies +
+			msecs_to_jiffies(AE9_ACM_KNOB_POLL_MS);
 		spec->ae9_acm_quiet_until = jiffies;
 		ae9_acm_queue_locked(spec);
 	}
@@ -10015,16 +10046,22 @@ static enum ae9_acm_job ae9_acm_begin_work(struct ca0132_spec *spec)
 	if (spec->ae9_acm_active) {
 		if (!time_before(now, spec->ae9_acm_service_due))
 			job = AE9_ACM_JOB_SERVICE;
-		else if (!time_before(now, ae9_acm_next_ui_work_locked(spec)))
-			job = AE9_ACM_JOB_DISPLAY;
 		else if (!time_before(now, ae9_clock_diag_slot_locked(spec,
 								      spec->ae9_acm_service_due)))
 			job = AE9_ACM_JOB_CLOCK;
+		else if (!time_before(now, ae9_acm_next_knob_work_locked(spec)))
+			job = AE9_ACM_JOB_KNOB;
+		else if (!time_before(now, ae9_acm_next_ui_work_locked(spec)))
+			job = AE9_ACM_JOB_DISPLAY;
 		if (job != AE9_ACM_JOB_NONE)
 			spec->ae9_acm_busy = true;
 		else
 			ae9_acm_queue_locked(spec);
-		spec->ae9_acm_ui_only = job == AE9_ACM_JOB_DISPLAY;
+		if (job == AE9_ACM_JOB_SERVICE || job == AE9_ACM_JOB_KNOB)
+			spec->ae9_acm_knob_due = now +
+				msecs_to_jiffies(AE9_ACM_KNOB_POLL_MS);
+		spec->ae9_acm_ui_only = job == AE9_ACM_JOB_DISPLAY ||
+			job == AE9_ACM_JOB_KNOB;
 	}
 	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
 	return job;
@@ -10044,6 +10081,21 @@ static void ae9_acm_finish_work(struct ca0132_spec *spec,
 	spec->ae9_acm_ui_only = false;
 	ae9_acm_queue_locked(spec);
 	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+}
+
+/* A first idle detent starts the existing turbo without delaying service. */
+static void ae9_acm_finish_knob(struct ca0132_spec *spec)
+{
+	unsigned long flags;
+	unsigned long due = jiffies +
+		msecs_to_jiffies(AE9_ACM_KNOB_POLL_MS);
+
+	spin_lock_irqsave(&spec->ae9_acm_work_lock, flags);
+	if (spec->ae9_acm_turbo &&
+	    time_before(due, spec->ae9_acm_service_due))
+		spec->ae9_acm_service_due = due;
+	spin_unlock_irqrestore(&spec->ae9_acm_work_lock, flags);
+	ae9_acm_finish_work(spec, 0);
 }
 
 /* AE-9 UART register map and clock-diagnostic transport. */
@@ -11200,6 +11252,16 @@ static void ae9_acm_work_fn(struct work_struct *work)
 		if (ae9_acm_take_display(spec))
 			ae9_acm_show_volume(spec);
 		ae9_acm_finish_work(spec, 0);
+		return;
+	}
+
+	if (job == AE9_ACM_JOB_KNOB) {
+		ae9_acm_knob(codec);
+		if (spec->ae9_acm_show_mode_ticks <= 0 &&
+		    !READ_ONCE(spec->ae9_acm_pending_mode) &&
+		    ae9_acm_take_display(spec))
+			ae9_acm_show_volume(spec);
+		ae9_acm_finish_knob(spec);
 		return;
 	}
 
@@ -13420,7 +13482,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2-overlayfix1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2-overlayfix1-knobpoll1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,
