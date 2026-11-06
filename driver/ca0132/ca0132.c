@@ -1259,6 +1259,7 @@ struct ca0132_spec {
 	u64 ae9_clock_sample_begin;
 	u64 ae9_clock_sample_end;
 	bool ae9_acm_present;
+	bool ae9_acm_tx_failed; /* stop ACM UART traffic until driver reprobe */
 	unsigned int ae9_acm_display_tx_left; /* diagnostic log budget */
 	bool ae9_acm_display_tx_failed; /* stop the display trial after failure */
 	bool ae9_acm_knob_tx_failed; /* stop the knob TX trial after failure */
@@ -9759,7 +9760,7 @@ static unsigned long ae9_acm_next_ui_work_locked(struct ca0132_spec *spec)
 	if (!spec->ae9_acm_ui_pending || !READ_ONCE(ae9_acm_poll) ||
 	    !spec->ae9_acm_present || spec->ae9_acm_show_mode_ticks > 0 ||
 	    READ_ONCE(spec->ae9_acm_pending_mode) ||
-	    spec->ae9_acm_display_tx_failed)
+	    spec->ae9_acm_display_tx_failed || READ_ONCE(spec->ae9_acm_tx_failed))
 		return due;
 	if (time_before(ui, spec->ae9_acm_quiet_until))
 		ui = spec->ae9_acm_quiet_until;
@@ -9788,6 +9789,7 @@ static bool ae9_clock_diag_allowed_locked(struct ca0132_spec *spec,
 		!spec->ae9_acm_display_tx_failed &&
 		!spec->ae9_acm_knob_tx_failed &&
 		!spec->ae9_acm_button_tx_failed &&
+		!READ_ONCE(spec->ae9_acm_tx_failed) &&
 		time_before(now, spec->ae9_clock_expires);
 }
 
@@ -10373,29 +10375,53 @@ failed:
 }
 
 /* AE-9 UART transports: keep maintenance and trial TX paths distinct. */
-static void ae9_acm_tx(struct ca0132_spec *spec, const u8 *p, int n)
+static int ae9_acm_tx(struct ca0132_spec *spec, const u8 *p, int n)
 {
 	void __iomem *b2 = spec->mem_base;
-	int i, w;
+	u32 status = 0;
+	int i, w, err = -ETIMEDOUT;
 
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		return -EIO;
 	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
 		(void)readb(b2 + AE9_U_RBR);		/* drain stale RX, as CtxHda does */
 	for (i = 0; i < n; i++) {
-		for (w = 0; w < 100 && !(readb(b2 + AE9_U_LSR) & 0x20); w++)
-			usleep_range(50, 100);		/* never busy-wait: this runs in a workqueue */
+		for (w = 0; w < 100; w++) {
+			/* Use Creative TX-ready, as in display/C2/B1 transfers. */
+			status = readl(b2 + AE9_U_STS);
+			if (status == ~0U) {
+				err = -ENODEV;
+				goto failed;
+			}
+			if (status & 0x02)
+				break;
+			usleep_range(50, 100);
+		}
+		if (w == 100)
+			goto failed;
 		writeb(p[i], b2 + AE9_U_THR);
 		readb(b2 + AE9_U_LCR);
 	}
+	return 0;
+
+failed:
+	/* A partial frame must not be followed by another exchange. */
+	WRITE_ONCE(spec->ae9_acm_tx_failed, true);
+	codec_warn(spec->codec,
+		   "AE-9 ACM maintenance TX failed: sent=%d/%d status=%08x err=%d; UART stopped until reboot\n",
+		   i, n, status, err);
+	return err;
 }
 
-/* Trial only for knob queries; keep the generic maintenance TX unchanged. */
+/* Knob queries retain their DWORD readiness test and wait budget. */
 static bool ae9_acm_knob_tx(struct ca0132_spec *spec, const u8 *p, int n)
 {
 	void __iomem *b2 = spec->mem_base;
 	u32 status = 0;
 	int i, w;
 
-	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_knob_tx_failed)
+	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_knob_tx_failed ||
+	    READ_ONCE(spec->ae9_acm_tx_failed))
 		return false;
 	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
 		(void)readb(b2 + AE9_U_RBR);
@@ -10425,14 +10451,15 @@ failed:
 	return false;
 }
 
-/* Trial only for B1 button queries; keep maintenance and C2 unchanged. */
+/* B1 queries retain their separate DWORD readiness test and wait budget. */
 static bool ae9_acm_button_tx(struct ca0132_spec *spec, const u8 *p, int n)
 {
 	void __iomem *b2 = spec->mem_base;
 	u32 status = 0;
 	int i, w;
 
-	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_button_tx_failed)
+	if (ca0132_quirk(spec) != QUIRK_AE9 || spec->ae9_acm_button_tx_failed ||
+	    READ_ONCE(spec->ae9_acm_tx_failed))
 		return false;
 	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
 		(void)readb(b2 + AE9_U_RBR);
@@ -10472,7 +10499,7 @@ static void ae9_acm_display_tx(struct ca0132_spec *spec, const u8 *p, int n)
 	u32 status = 0;
 	int i, w;
 
-	if (spec->ae9_acm_display_tx_failed)
+	if (spec->ae9_acm_display_tx_failed || READ_ONCE(spec->ae9_acm_tx_failed))
 		return;
 	start = ktime_get();
 	for (i = 0; i < 64 && (readb(b2 + AE9_U_LSR) & 0x01); i++)
@@ -10587,24 +10614,38 @@ static const u8 ae9_acm_unlock3_frame[] = {
 	0xf0, 0x54, 0x04, 0x11, 0x11, 0x11, 0x11, 0xf7
 };
 
-static void ae9_acm_cmd(struct ca0132_spec *spec, const u8 *p, int n)
+static int ae9_acm_cmd(struct ca0132_spec *spec, const u8 *p, int n)
 {
 	u8 ack[16];
+	int err;
 
-	ae9_acm_tx(spec, p, n);
+	err = ae9_acm_tx(spec, p, n);
+	if (err)
+		return err;
+	/* Preserve the existing reply handling; ACK semantics vary by command. */
 	ae9_acm_rx(spec, ack, sizeof(ack), 100);
+	return 0;
 }
 
-/* Keepalive always sends these exchanges; init calls after a valid probe. */
-static void ae9_acm_unlock(struct ca0132_spec *spec)
+/* Ordered session exchanges; stop at the first transport error. */
+static int ae9_acm_unlock(struct ca0132_spec *spec)
 {
-	ae9_acm_cmd(spec, ae9_acm_unlock1_frame,
-		    sizeof(ae9_acm_unlock1_frame));
-	ae9_acm_cmd(spec, ae9_acm_unlock2_frame,
-		    sizeof(ae9_acm_unlock2_frame));
-	ae9_acm_cmd(spec, ae9_acm_read_frame, sizeof(ae9_acm_read_frame));
-	ae9_acm_cmd(spec, ae9_acm_unlock3_frame,
-		    sizeof(ae9_acm_unlock3_frame));
+	int err;
+
+	err = ae9_acm_cmd(spec, ae9_acm_unlock1_frame,
+			  sizeof(ae9_acm_unlock1_frame));
+	if (err)
+		return err;
+	err = ae9_acm_cmd(spec, ae9_acm_unlock2_frame,
+			  sizeof(ae9_acm_unlock2_frame));
+	if (err)
+		return err;
+	err = ae9_acm_cmd(spec, ae9_acm_read_frame,
+			  sizeof(ae9_acm_read_frame));
+	if (err)
+		return err;
+	return ae9_acm_cmd(spec, ae9_acm_unlock3_frame,
+			   sizeof(ae9_acm_unlock3_frame));
 }
 
 /* F0 03 03 <reg> <value> <mask> F7 : set register bits */
@@ -10622,7 +10663,9 @@ static int ae9_acm_getreg(struct ca0132_spec *spec, u8 reg)
 	u8 rx[8];
 	int n;
 
-	ae9_acm_tx(spec, q, sizeof(q));
+	n = ae9_acm_tx(spec, q, sizeof(q));
+	if (n < 0)
+		return n;
 	n = ae9_acm_rx(spec, rx, 6, 100);
 	if (n != 6 || rx[0] != 0xf0 || rx[1] != 0x83 || rx[2] != 2 ||
 	    rx[3] != reg || rx[5] != 0xf7) {
@@ -10641,6 +10684,8 @@ static void ae9_acm_display_frame(struct ca0132_spec *spec, const char *txt, boo
 	u8 f[13] = { 0xf0, 0x11, 0x09, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xf7 };
 	int i;
 
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		return;
 	for (i = 0; i < 8 && txt[i]; i++)
 		f[3 + i] = txt[i];
 	if (wait)
@@ -10937,12 +10982,18 @@ static void ae9_acm_apply_mode(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
 
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		return;
 	mutex_lock(&spec->ae9_output_mutex);
 	spec->ae9_acm_pending_mode = false;
 	ae9_acm_apply_regs(spec);
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		goto out;
 	ae9_apply_output_path(codec);
 	ae9_acm_display(spec, spec->cur_out_type == HEADPHONE_OUT ? "-HP-" : "-SP-");
-	spec->ae9_acm_show_mode_ticks = 10;
+	if (!READ_ONCE(spec->ae9_acm_tx_failed))
+		spec->ae9_acm_show_mode_ticks = 10;
+out:
 	mutex_unlock(&spec->ae9_output_mutex);
 }
 
@@ -11025,6 +11076,8 @@ static void ae9_acm_check_regs(struct hda_codec *codec)
 		ae9_acm_apply_regs(spec);
 	}
 	mutex_unlock(&spec->ae9_output_mutex);
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		return;
 	ae9_acm_update_headphone_jack(codec, r2);
 }
 
@@ -11037,9 +11090,11 @@ static bool ae9_acm_keepalive(struct ca0132_spec *spec)
 	int n;
 
 	/* Windows sends these five every tick (capture: 164-167 each in 164 ticks) */
-	ae9_acm_tx(spec, ae9_acm_probe_frame, sizeof(ae9_acm_probe_frame));
+	if (ae9_acm_tx(spec, ae9_acm_probe_frame, sizeof(ae9_acm_probe_frame)))
+		return false;
 	n = ae9_acm_rx(spec, rx, sizeof(rx), 100);
-	ae9_acm_unlock(spec);
+	if (ae9_acm_unlock(spec))
+		return false;
 	return ae9_acm_probe_valid(rx, n);
 }
 
@@ -11058,7 +11113,7 @@ static bool ae9_acm_init(struct hda_codec *codec)
 	u8 rx[16], lcr;
 	int n = 0, w, attempt;
 
-	if (!b2)
+	if (!b2 || READ_ONCE(spec->ae9_acm_tx_failed))
 		return false;
 	/*
 	 * Each attempt: (attempt>0) power-CYCLE a wedged ACM MCU -- drive GPIO5
@@ -11086,8 +11141,9 @@ static bool ae9_acm_init(struct hda_codec *codec)
 		writeb(0x00, b2 + AE9_U_DLM); readb(b2 + AE9_U_DLM);
 		writeb(lcr & ~0x80, b2 + AE9_U_LCR); readb(b2 + AE9_U_LCR);
 		msleep(300);
-		ae9_acm_tx(spec, ae9_acm_probe_frame,
-			   sizeof(ae9_acm_probe_frame));
+		if (ae9_acm_tx(spec, ae9_acm_probe_frame,
+			       sizeof(ae9_acm_probe_frame)))
+			return false;
 		n = ae9_acm_rx(spec, rx, 9, 500);
 		codec_info(codec, "AE-9 ACM: probe attempt %d%s -> %d bytes: %*ph\n",
 			   attempt, attempt ? " (after power-cycle)" : "", n,
@@ -11103,18 +11159,26 @@ static bool ae9_acm_init(struct hda_codec *codec)
 	spec->ae9_acm_fw = (u32)rx[4] | (u32)rx[5] << 8 |
 			   (u32)rx[6] << 16 | (u32)rx[7] << 24;
 	/* Windows init order (BAR2 capture 2026-09-03, once per session) */
-	ae9_acm_unlock(spec);
-	ae9_acm_cmd(spec, magic, sizeof(magic));	/* F0 55: write DEADC0DE @ 0x042000 */
-	ae9_acm_cmd(spec, reg5, sizeof(reg5));		/* detect handshake: reg5 |= 3 */
-	ae9_acm_cmd(spec, tlong2, sizeof(tlong2));	/* AcmEncoderLongPressMs 3000 */
-	ae9_acm_cmd(spec, filt, sizeof(filt));		/* encoder filter window 100..500 */
-	ae9_acm_cmd(spec, tlong1, sizeof(tlong1));	/* AcmSBXLongPressMs 5000 */
-	ae9_acm_cmd(spec, cmd05, sizeof(cmd05));	/* F0 05 03 02 01 00 (Windows init) */
+	/* DEADC0DE at 0x042000, reg5 handshake and existing session timings. */
+	if (ae9_acm_unlock(spec) ||
+	    ae9_acm_cmd(spec, magic, sizeof(magic)) ||
+	    ae9_acm_cmd(spec, reg5, sizeof(reg5)) ||
+	    ae9_acm_cmd(spec, tlong2, sizeof(tlong2)) ||
+	    ae9_acm_cmd(spec, filt, sizeof(filt)) ||
+	    ae9_acm_cmd(spec, tlong1, sizeof(tlong1)) ||
+	    ae9_acm_cmd(spec, cmd05, sizeof(cmd05)))
+		return false;
 	ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));	/* SBX light = Enable OutFX */
-	ae9_acm_cmd(spec, led, sizeof(led));		/* encoder LED on */
+	if (READ_ONCE(spec->ae9_acm_tx_failed) ||
+	    ae9_acm_cmd(spec, led, sizeof(led)))
+		return false;
 	ae9_acm_display(spec, "AE-9");
-	ae9_acm_cmd(spec, blink, sizeof(blink));	/* blink interval 0 */
+	if (READ_ONCE(spec->ae9_acm_tx_failed) ||
+	    ae9_acm_cmd(spec, blink, sizeof(blink)))
+		return false;
 	ae9_acm_apply_mode(codec);
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		return false;
 	codec_info(codec, "AE-9 ACM: present, firmware 0x%08x, output %s\n",
 		   spec->ae9_acm_fw,
 		   spec->cur_out_type == HEADPHONE_OUT ? "headphone" : "speakers");
@@ -11150,6 +11214,13 @@ static void ae9_acm_work_fn(struct work_struct *work)
 	}
 
 	ae9_gpio_cmd(spec, 0x0105);
+	if (READ_ONCE(spec->ae9_acm_tx_failed)) {
+		if (!ae9_acm_poll) {
+			ae9_acm_park(spec);
+			return;
+		}
+		goto out;
+	}
 	if (!spec->ae9_acm_present) {
 		if ((spec->ae9_acm_tick++ % 10) == 0) {
 			spec->ae9_acm_present = ae9_acm_init(codec);
@@ -11187,11 +11258,15 @@ static void ae9_acm_work_fn(struct work_struct *work)
 			spec->ae9_acm_dead_ticks = 0;
 		}
 	}
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		goto out;
 	if (READ_ONCE(spec->ae9_acm_pending_mode)) {
 		ae9_acm_apply_mode(codec);
 	} else if (!turbo && (spec->ae9_acm_tick % 10) == 0) {
 		ae9_acm_check_regs(codec);
 	}
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		goto out;
 	ae9_acm_knob(codec);
 	if (!turbo) {
 		ae9_acm_service_buttons(codec);
@@ -11201,6 +11276,8 @@ static void ae9_acm_work_fn(struct work_struct *work)
 		spec->ae9_acm_pending_fx = false;
 		ae9_acm_set_fx_light(spec, ae9_fx_enabled(spec));
 	}
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		goto out;
 	if (spec->ae9_acm_show_mode_ticks > 0) {
 		if (--spec->ae9_acm_show_mode_ticks == 0)
 			ae9_acm_display_changed(spec);
@@ -11889,6 +11966,8 @@ static int ae9_acm_power_down(struct ca0132_spec *spec)
 	u32 status;
 	int i, w;
 
+	if (READ_ONCE(spec->ae9_acm_tx_failed))
+		return -EIO;
 	if (!spec->ae9_acm_present)
 		return 0;
 
@@ -13351,7 +13430,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

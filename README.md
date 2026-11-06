@@ -154,3 +154,7 @@ la machine de référence, avec diagnostic activé. Ces observations ne
 constituent pas une qualification universelle. Les appuis limites, autres cartes, autres noyaux
 et la veille/reprise ne sont pas universellement qualifiés. Le correctif
 UART de maintenance encore en étude n’est pas inclus.
+
+## Maintenance ACM, molette et présence micro
+
+- `mainttx2` : Attendre le statut Creative sur 32 bits pour les transmissions de maintenance ; arrêter les échanges après une erreur ou une trame partielle.
