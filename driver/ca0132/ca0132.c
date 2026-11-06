@@ -9455,10 +9455,8 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 	 * Output-connect overlay: Windows DMA-loads a small XRAM image to
 	 * 0x0b7b10 + 0x3f3a0 here, between master-control states 3 and 4, on
 	 * every firmware start (register capture 2026-09-03, ops:2093-2161).
-	 * This is the piece that wires the DSP's internal output pipeline to
-	 * the DACs; without it the DSP runs but emits silence. dspxfr uses the
-	 * segment chip addresses directly (the capture's SCP 0x3a/0x3b address
-	 * queries are internal to the Windows loader and are not needed here).
+	 * Use the DSP loader's 0x3a/0x3b protocol to transfer the patch.
+	 * Do not precede it with another direct DSPDMAC transfer.
 	 */
 	err = request_firmware(&ovl_fw, AE9_OVERLAY_FW, codec->card->dev);
 	if (err < 0) {
@@ -9472,19 +9470,11 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 		goto out;
 	}
 	overlay = (const u32 *)ovl_fw->data;
-	overlay_started = true;
-	spec->ae9_loader_ctx = true;
-	err = dspload_image(codec, (const struct dsp_image_seg *)overlay,
-			    true, 0, false, 0);
-	spec->ae9_loader_ctx = false;
-	if (err < 0)
-		goto out;
 
 	/*
-	 * Now replay Windows' ACTUAL overlay path: the same bytes, but each
-	 * segment announced to the DSP's own loader (0x3a/0x3b) which then pulls
-	 * them itself. The host DMA above is kept as belt-and-suspenders (bytes
-	 * proven to land); this step is what tells the DSP the overlay exists.
+	 * Announce each segment to the DSP's own loader (0x3a/0x3b), which
+	 * pulls the data from the HDA stream. The main firmware may already
+	 * contain these bytes; its initial download is left unchanged.
 	 * Image layout of ae9_dsp_output_overlay[]: [0..2] seg1 hdr, [3..80]
 	 * 78 words, [81..83] seg2 hdr, [84..104] 21 words, [105..107] term.
 	 * Loader image: seg1 verbatim + seg2 = the 20 words after 0x3f3a0
@@ -9503,6 +9493,7 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 	ld[104] = 0x4c46584d;
 	ld[105] = 0xefbeadde;
 	ld[106] = 0;
+	overlay_started = true;
 	spec->ae9_loader_ctx = true;
 	spec->ae9_dsp_loader = true;
 	err = dspload_image(codec, (const struct dsp_image_seg *)ld,
@@ -9511,14 +9502,12 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 	spec->ae9_loader_ctx = false;
 	if (err < 0)
 		goto out;
+	codec_info(codec,
+		   "AE-9: overlay loader returned success (2 segments, 98 words)\n");
 
 	/*
-	 * The overlay downloads leave DSPDMAC ch0 "started" with the host DMA
-	 * config (idle dump: CHNLSTART=1, DMACFG ch0=029e6744) and it stays that
-	 * way through playback. If the DSP hands ch0 to the audio INPUT stream it
-	 * reads the stale overlay buffer, not the HDA converter, and the DSP
-	 * outputs zeros -- proven by the ES9038 automute tripping on a loud tone.
-	 * Windows never host-DMAs the overlay, so it has no such residue. Clear it.
+	 * Preserve the post-transfer channel-0 stop before table setup.
+	 * Dropping the redundant preload does not change this cleanup.
 	 */
 	err = dsp_dma_stop(codec, 0, true);
 	if (err < 0)
@@ -9527,8 +9516,9 @@ static int ae9_dsp_scp_startup(struct hda_codec *codec)
 	if (err < 0)
 		goto out;
 	/*
-	 * Prove the overlay landed: word 5 of the 0x3f3a0 table is 0x04000086
-	 * and is written only by the DMA (chipio is byte-addressed: +5*4).
+	 * Check word 5 of the table (byte address +5*4). The main firmware
+	 * may already contain this value, so this is not proof of which
+	 * transfer supplied it; transport errors must still be propagated.
 	 */
 	err = chipio_read(codec, 0x3f3b4, &rb);
 	if (err < 0)
@@ -13430,7 +13420,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2-overlayfix1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

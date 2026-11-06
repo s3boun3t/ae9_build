@@ -158,3 +158,4 @@ UART de maintenance encore en étude n’est pas inclus.
 ## Maintenance ACM, molette et présence micro
 
 - `mainttx2` : Attendre le statut Creative sur 32 bits pour les transmissions de maintenance ; arrêter les échanges après une erreur ou une trame partielle.
+- `overlayfix1` : Retirer le transfert direct B redondant de l’overlay DSP, en conservant A+C, les contrôles d’erreur et le nettoyage.
