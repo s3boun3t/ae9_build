@@ -1279,6 +1279,8 @@ struct ca0132_spec {
 	bool ae9_acm_regs_logged;	/* first periodic ACM register check logged */
 	bool ae9_hp_jack_valid;		/* physical headphone state sampled */
 	bool ae9_hp_jack_present;	/* ACM reg2 bit5 is active low */
+	struct snd_jack *ae9_acm_mic_jack;	/* owned by the HDA jack table */
+	bool ae9_acm_mic_managed;	/* worker lifetime guard is registered */
 	struct mutex ae9_output_mutex;	/* output selection and ACM mode */
 	int ae9_acm_dead_ticks;		/* consecutive keepalive probes unanswered */
 	int ae9_acm_sel;		/* module's own output selector bits last seen (items 5/6) */
@@ -1339,6 +1341,7 @@ enum {
 #endif
 
 static void ae9_acm_display_changed(struct ca0132_spec *spec);
+static void ae9_acm_stop(struct ca0132_spec *spec, bool removing);
 
 static const struct hda_pintbl alienware_pincfgs[] = {
 	{ 0x0b, 0x90170110 }, /* Builtin Speaker */
@@ -7718,6 +7721,59 @@ static void ae9_vmaster_mute_changed(void *private_data, int enabled)
 	ae9_acm_display_changed(spec);
 }
 
+/* Stop reports before ALSA disconnects the jack's input device or controls. */
+static int ae9_acm_mic_jack_stop(struct snd_device *device)
+{
+	struct ca0132_spec *spec = device->device_data;
+
+	ae9_acm_stop(spec, true);
+	return 0;
+}
+
+static int ae9_acm_mic_jack_free(struct snd_device *device)
+{
+	struct ca0132_spec *spec = device->device_data;
+
+	ae9_acm_mic_jack_stop(device);
+	spec->ae9_acm_mic_jack = NULL;
+	spec->ae9_acm_mic_managed = false;
+	return 0;
+}
+
+/* Publish the standard Mic Jack from ACM status instead of codec pin sense. */
+static int ae9_add_acm_mic_jack(struct hda_codec *codec)
+{
+	static const struct snd_device_ops mic_ops = {
+		.dev_disconnect = ae9_acm_mic_jack_stop,
+		.dev_free = ae9_acm_mic_jack_free,
+	};
+	struct ca0132_spec *spec = codec->spec;
+	struct hda_jack_tbl *jack;
+	int err;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9)
+		return 0;
+	if (spec->ae9_acm_mic_managed)
+		return 0;
+	err = snd_hda_jack_add_kctl(codec, spec->input_pins[0], "Mic",
+				    false, SND_JACK_MICROPHONE, NULL);
+	if (err < 0)
+		return err;
+	jack = snd_hda_jack_tbl_get(codec, spec->input_pins[0]);
+	if (!jack || !jack->jack)
+		return -ENODEV;
+	/* After setup, only the ACM may report this HDA-owned jack. */
+	jack->block_report = 1;
+	/* Equal-type ALSA components are disconnected/freed in reverse order. */
+	err = snd_device_new(codec->card, SNDRV_DEV_JACK, spec, &mic_ops);
+	if (err < 0)
+		return err;
+	spec->ae9_acm_mic_managed = true;
+	/* Publish only after the stop callbacks and report block are ready. */
+	smp_store_release(&spec->ae9_acm_mic_jack, jack->jack);
+	return 0;
+}
+
 static int ca0132_build_controls(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -7893,6 +7949,11 @@ static int ca0132_build_controls(struct hda_codec *codec)
 	add_tuning_ctls(codec);
 #endif
 
+	if (ca0132_quirk(spec) == QUIRK_AE9) {
+		err = ae9_add_acm_mic_jack(codec);
+		if (err < 0)
+			return err;
+	}
 	err = snd_hda_jack_add_kctls(codec, &spec->autocfg);
 	if (err < 0)
 		return err;
@@ -11089,7 +11150,21 @@ out:
 		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
 }
 
-/* Every 10th tick, verify the amp, report the selector and sample the jack. */
+/* ACM register 2 bit 4 reports the 3.5 mm microphone plug, active low. */
+static void ae9_acm_update_mic_jack(struct hda_codec *codec, int reg2)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct snd_jack *jack;
+
+	if (ca0132_quirk(spec) != QUIRK_AE9 || reg2 < 0 || reg2 > 0xff)
+		return;
+	/* Pair with setup publication before the worker uses the jack. */
+	jack = smp_load_acquire(&spec->ae9_acm_mic_jack);
+	if (jack)
+		snd_jack_report(jack, reg2 & 0x10 ? 0 : SND_JACK_MICROPHONE);
+}
+
+/* Every 10th tick, verify the amp, report the selector and sample the jacks. */
 static void ae9_acm_check_regs(struct hda_codec *codec)
 {
 	struct ca0132_spec *spec = codec->spec;
@@ -11098,6 +11173,8 @@ static void ae9_acm_check_regs(struct hda_codec *codec)
 	int r7 = ae9_acm_getreg(spec, 0x07);
 	int sel;
 
+	/* A valid microphone sample does not depend on register 7. */
+	ae9_acm_update_mic_jack(codec, r2);
 	if (r2 < 0 || r7 < 0) {
 		codec_info(codec, "AE-9 ACM: register read failed (reg2=%d reg7=%d)\n", r2, r7);
 		return;
@@ -12896,6 +12973,8 @@ static void ca0132_free(struct hda_codec *codec)
 
 	cancel_delayed_work_sync(&spec->unsol_hp_work);
 	ae9_acm_stop(spec, true);
+	if (spec->ae9_acm_mic_managed)
+		snd_device_free(codec->card, spec);
 	err = snd_hda_power_up(codec);
 	if (ca0132_quirk(spec) == QUIRK_AE9 && err < 0) {
 		codec_warn(codec, "AE-9 remove: power-up failed: %d\n", err);
@@ -13482,7 +13561,7 @@ MODULE_DEVICE_TABLE(hdaudio, snd_hda_id_ca0132);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Creative Sound Core3D codec");
-MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2-overlayfix1-knobpoll1");
+MODULE_VERSION("0.1.0-darknikgr-f33f44c-abi1-hpauto5-displayui1-knobtx1-buttontx1-micdefault1-clockdiag3-acmfix1-filterfix1-pmfix1-dspfix2-shutdownfix1-cleanup1-refactor1-headerfix1-mainttx2-overlayfix1-knobpoll1-micjack1");
 
 static struct hda_codec_driver ca0132_driver = {
 	.id = snd_hda_id_ca0132,

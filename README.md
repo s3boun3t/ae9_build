@@ -160,3 +160,23 @@ UART de maintenance encore en étude n’est pas inclus.
 - `mainttx2` : Attendre le statut Creative sur 32 bits pour les transmissions de maintenance ; arrêter les échanges après une erreur ou une trame partielle.
 - `overlayfix1` : Retirer le transfert direct B redondant de l’overlay DSP, en conservant A+C, les contrôles d’erreur et le nettoyage.
 - `knobpoll1` : Interroger légèrement la molette entre deux cycles de maintenance, à 50 ms nominaux au repos, sans changer les pas de volume.
+- `micjack1` : Fournir la présence de la fiche micro ACM 3,5 mm par le contrôle ALSA standard Mic Jack, exploité par le profil existant de Mint.
+
+Les versions de cette série ont été essayées sur la machine de référence,
+avec le diagnostic clock activé. L’utilisateur confirme ACM, son et
+molette sous mainttx2/overlayfix1, puis une molette très réactive sous
+knobpoll1. Sous micjack1, il confirme l’apparition de l’entrée micro dans
+Mint après insertion et sa disparition après retrait. Ces observations
+ne mesurent ni la latence physique ni la qualité du signal capturé.
+
+La présence micro est sondée environ toutes les cinq secondes au repos,
+plus les échanges ; les lectures peuvent être différées pendant le turbo.
+Ce délai est conservé à la demande de l’utilisateur. XLR/TRS n’est pas
+détecté par ce bit ; le port partagé peut alors être présenté absent.
+Aucun profil ou réglage de session n’est installé par ces changements.
+
+La cible minimale demandée est Ubuntu 24.04.1 LTS. Les vérifications
+de cette série portent sur XanMod 7.2.14 ; la compatibilité de cette
+cible minimale et des autres noyaux reste à établir. Les en-têtes privés
+HDA et leur ABI doivent correspondre au noyau utilisé. Veille/reprise,
+XLR et autres cartes ne sont pas qualifiés par ces seuls essais.
