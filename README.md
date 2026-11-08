@@ -1,3 +1,9 @@
+**Projet archivé — développement arrêté ici.**
+
+La suite du développement se trouve dans
+https://github.com/s3boun3t/linux-ae9
+
+
 # Sound Blaster AE-9 — pilote Linux
 
 Sources du pilote CA0132 et du cœur HDA provenant de
